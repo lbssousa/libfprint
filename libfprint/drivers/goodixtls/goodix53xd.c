@@ -641,9 +641,12 @@ static void scan_run_state(FpiSsm* ssm, FpDevice* dev)
         break;
     case SCAN_STAGE_GET_IMG:
         fpi_image_device_report_finger_status(img_dev, TRUE);
-        /* NB: originally written as {0x05, 0x03}; value is a scalar guint16 so
-         * only 0x05 was ever used. Behaviour preserved verbatim. */
-        guint16 payload = 0x05;
+        /* Write reg 0x022c (556) <- bytes {0x05, 0x03}. The packed value
+         * field serialises little-endian, so 0x0305 produces those bytes on
+         * the wire. Confirmed against goodix-fp-dump driver_53xd.py (the
+         * original {0x05, 0x03} brace-init of a scalar silently dropped the
+         * second byte). */
+        guint16 payload = 0x0305;
         goodix_send_write_sensor_register(dev, 556, payload, write_sensor_complete, ssm);
         break;
     }
