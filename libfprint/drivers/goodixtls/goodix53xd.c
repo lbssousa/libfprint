@@ -62,11 +62,11 @@
 #define GOODIX53XD_MIN_CAPTURE_KEYPOINTS 8
 #define GOODIX53XD_SIGFM_BEST_MIN 10
 
-// Finger presence is detected from the raw (pre-normalisation) dynamic range
-// of a captured frame: a finger creates ridge/valley capacitance contrast, an
-// empty platen is nearly flat. This threshold is provisional and should be
-// tuned from the "capture raw range" debug values (finger vs no finger).
-#define GOODIX53XD_FINGER_RAW_RANGE 400
+// Finger presence is detected from the number of SIFT keypoints SIGFM finds:
+// an empty platen yields ~0, a finger yields many. (The raw dynamic range is
+// useless here: fixed saturated/dead pixels keep it pinned high even with no
+// finger.) Provisional; tune from the "capture keypoints" debug values.
+#define GOODIX53XD_FINGER_MIN_KEYPOINTS 5
 // Delay between finger-detection polls (ms).
 #define GOODIX53XD_FINGER_POLL_MS 80
 
@@ -79,10 +79,14 @@ struct _FpiDeviceGoodixTls53XD {
 
   // Latest decoded capture as an 8-bit grayscale GOODIX53XD_SENSOR_PIXELS buffer
   guint8* captured_image;
-  // Raw (12-bit) dynamic range of the latest capture, used for finger detection
+  // Raw (12-bit) dynamic range of the latest capture (informational)
   guint last_raw_range;
+  // SIGFM keypoint count of the latest capture, used for finger detection
+  int last_keypoints;
   // Target state for the next poll re-jump (used by poll_timeout)
   gint poll_target_state;
+  // Rotating index for GOODIX53XD_DUMP debug PGM files
+  guint dump_counter;
 
   // Enrollment: array of captured 8-bit images (g_free'd)
   GPtrArray* enroll_images;
@@ -447,19 +451,40 @@ static void on_capture_image(FpDevice* dev, guint8* data, guint16 len,
             rmax = frame[i];
     }
     self->last_raw_range = rmax - rmin;
-    fp_dbg("capture: raw range %u (finger threshold %u)",
-           self->last_raw_range, GOODIX53XD_FINGER_RAW_RANGE);
 
     g_clear_pointer(&self->captured_image, g_free);
     self->captured_image = g_malloc(GOODIX53XD_SENSOR_PIXELS);
     squash_frame_linear(frame, self->captured_image);
+
+    // Keypoint count is our finger-presence / quality signal.
+    SigfmImgInfo* info = sigfm_extract(self->captured_image, GOODIX53XD_WIDTH,
+                                       GOODIX53XD_HEIGHT);
+    self->last_keypoints = sigfm_keypoints_count(info);
+    sigfm_free_info(info);
+    fp_dbg("capture: raw range %u, keypoints %d (finger min %d)",
+           self->last_raw_range, self->last_keypoints,
+           GOODIX53XD_FINGER_MIN_KEYPOINTS);
+
+    // Optional debug: dump the latest 8-bit frame as a PGM for visual
+    // inspection (set GOODIX53XD_DUMP=/path/prefix).
+    const char* dump = g_getenv("GOODIX53XD_DUMP");
+    if (dump) {
+        g_autofree char* path =
+            g_strdup_printf("%s-%03d.pgm", dump, self->dump_counter++ % 20);
+        FILE* f = fopen(path, "wb");
+        if (f) {
+            fprintf(f, "P5\n%d %d\n255\n", GOODIX53XD_WIDTH, GOODIX53XD_HEIGHT);
+            fwrite(self->captured_image, 1, GOODIX53XD_SENSOR_PIXELS, f);
+            fclose(f);
+        }
+    }
 
     fpi_ssm_mark_completed(ssm);
 }
 
 static gboolean finger_is_present(FpiDeviceGoodixTls53XD* self)
 {
-    return self->last_raw_range >= GOODIX53XD_FINGER_RAW_RANGE;
+    return self->last_keypoints >= GOODIX53XD_FINGER_MIN_KEYPOINTS;
 }
 
 // Re-jump the (parent) task SSM to self->poll_target_state after a short delay.
