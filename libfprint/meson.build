@@ -256,9 +256,22 @@ libfprint_private = static_library('fprint-private',
     link_with: libnbis,
     install: false)
 
+# The only C++ source is the vendored SIGFM matcher (drivers/goodixtls ->
+# sigfm/sigfm.cpp). Newer GCC (16+) raises false-positive -Warray-bounds /
+# -Wstringop-* inside OpenCV headers and the binary (de)serialiser, which
+# libfprint's default -Werror turns fatal. Don't treat those as errors for the
+# C++ build.
+sigfm_cpp_args = cpp.get_supported_arguments([
+    '-Wno-error=array-bounds',
+    '-Wno-error=stringop-overflow',
+    '-Wno-error=stringop-overread',
+    '-Wno-error=maybe-uninitialized',
+])
+
 libfprint_drivers = static_library('fprint-drivers',
     sources: drivers_sources,
     c_args: drivers_cflags,
+    cpp_args: sigfm_cpp_args,
     dependencies: deps,
     link_with: libfprint_private,
     install: false)
