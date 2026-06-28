@@ -933,9 +933,11 @@ void goodix_send_tls_successfully_established(FpDevice *dev,
 void goodix_send_read_otp(FpDevice* dev, GoodixDefaultCallback callback,
                           gpointer user_data)
 {
-    /* NB: originally written as {0x40, 0x00}; payload is a scalar so only
-     * 0x40 was ever sent (sizeof == 1). Behaviour preserved verbatim. */
-    guint8 payload = 0x40;
+    /* READ_OTP body is two zero bytes, per goodix-fp-dump goodix.py
+     * read_otp() (b"\x00\x00"). The original {0x40, 0x00} brace-init of a
+     * scalar sent a single 0x40 byte instead, which does not match the
+     * reverse-engineered protocol. */
+    guint8 payload[] = {0x00, 0x00};
     GoodixCallbackInfo* cb_info;
 
     if (callback) {
@@ -944,7 +946,7 @@ void goodix_send_read_otp(FpDevice* dev, GoodixDefaultCallback callback,
         cb_info->callback = G_CALLBACK(callback);
         cb_info->user_data = user_data;
 
-        goodix_send_protocol(dev, GOODIX_CMD_READ_OTP, (guint8*) &payload,
+        goodix_send_protocol(dev, GOODIX_CMD_READ_OTP, payload,
                              sizeof(payload), NULL, TRUE, GOODIX_TIMEOUT, TRUE,
                              goodix_receive_default, cb_info);
         return;
