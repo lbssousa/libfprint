@@ -1,8 +1,19 @@
 // Goodix Tls driver for libfprint
+//
+// Goodix 538d (GF5298) driver: FpDevice with SIGFM matching.
+//
+// The capture/transport backend (real TLS-PSK handshake, FDT calibration and
+// image read) is kept from the original goodixtls53xd image driver
+// (infinytum/libfprint, based on goodix-fp-linux-dev). The enroll / verify /
+// identify state machines and the SIGFM-based matching shell are adapted from
+// AndyHazz/goodix53x5-libfprint, which is incompatible at the wire level (the
+// 53x5 speaks a custom GTLS, the 538d speaks real TLS-PSK) but provides the
+// FpDevice + SIGFM architecture this driver reuses.
 
 // Copyright (C) 2021 Alexander Meiler <alex.meiler@protonmail.com>
 // Copyright (C) 2021 Matthieu CHARETTE <matthieu.charette@gmail.com>
 // Copyright (C) 2021 Michael Teuscher <michael.teuscher@pm.me>
+// Copyright (C) 2022 Natasha England-Elbro <ashenglandelbro@protonmail.com>
 
 // This library is free software; you can redistribute it and/or
 // modify it under the terms of the GNU Lesser General Public
@@ -19,15 +30,8 @@
 // Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
 #include "fp-device.h"
-#include "fp-image-device.h"
-#include "fp-image.h"
-#include "fpi-assembling.h"
-#include "fpi-context.h"
-#include "fpi-image-device.h"
-#include "fpi-image.h"
+#include "fpi-device.h"
 #include "fpi-ssm.h"
-#include "glibconfig.h"
-#include "gusb/gusb-device.h"
 #include <stdio.h>
 #include <stdlib.h>
 #define FP_COMPONENT "goodixtls53xd"
@@ -39,18 +43,27 @@
 #include "goodix.h"
 #include "goodix_proto.h"
 #include "goodix53xd.h"
-
-#include <math.h>
+#include "sigfm/sigfm.hpp"
 
 #define GOODIX53XD_WIDTH 64
 #define GOODIX53XD_HEIGHT 80
 #define GOODIX53XD_SCAN_WIDTH 64
 #define GOODIX53XD_FRAME_SIZE (GOODIX53XD_WIDTH * GOODIX53XD_HEIGHT)
-// For every 4 pixels there are 6 bytes and there are 8 extra start bytes and 5
-// extra end
+// For every 4 pixels there are 6 bytes
 #define GOODIX53XD_RAW_FRAME_SIZE                                               \
     (GOODIX53XD_HEIGHT * GOODIX53XD_SCAN_WIDTH) / 4 * 6
-#define GOODIX53XD_CAP_FRAMES 10 // Number of frames we capture per swipe
+
+#define GOODIX53XD_SENSOR_PIXELS GOODIX53XD_FRAME_SIZE
+
+// Matching / enrollment tuning. These start from the AndyHazz 53x5 values but
+// the 538d sensor is smaller (64x80 vs 108x88), so fewer SIFT keypoints are
+// expected; they likely need tuning against real 538d captures.
+#define GOODIX53XD_ENROLL_SAMPLES 8
+#define GOODIX53XD_MIN_CAPTURE_KEYPOINTS 8
+#define GOODIX53XD_SIGFM_BEST_MIN 10
+// Best-effort delay (ms) used to debounce a press before re-arming finger
+// detection. A proper finger-up FDT event would be better; needs hardware.
+#define GOODIX53XD_FINGER_UP_DELAY_MS 200
 
 typedef unsigned short Goodix53xdPix;
 
@@ -59,9 +72,23 @@ struct _FpiDeviceGoodixTls53XD {
 
   guint8* otp;
 
-  GSList* frames;
+  // Latest decoded capture as an 8-bit grayscale GOODIX53XD_SENSOR_PIXELS buffer
+  guint8* captured_image;
 
-  Goodix53xdPix empty_img[GOODIX53XD_FRAME_SIZE];
+  // Enrollment: array of captured 8-bit images (g_free'd)
+  GPtrArray* enroll_images;
+  guint enroll_stage;
+
+  FpiSsm* task_ssm;
+
+  // Deferred verify/identify result reporting
+  gboolean verify_wait_finger_up;
+  gboolean pending_result_report;
+  gboolean action_result_reported;
+  FpiDeviceAction pending_result_action;
+  FpiMatchResult pending_verify_result;
+  FpPrint* pending_identify_match;
+  GError* pending_result_error;
 };
 
 G_DECLARE_FINAL_TYPE(FpiDeviceGoodixTls53XD, fpi_device_goodixtls53xd, FPI,
@@ -70,127 +97,130 @@ G_DECLARE_FINAL_TYPE(FpiDeviceGoodixTls53XD, fpi_device_goodixtls53xd, FPI,
 G_DEFINE_TYPE(FpiDeviceGoodixTls53XD, fpi_device_goodixtls53xd,
               FPI_TYPE_DEVICE_GOODIXTLS);
 
-// ---- ACTIVE SECTION START ----
+// ---------------------------------------------------------------------------
+// Generic SSM callbacks shared by activation and capture
+// ---------------------------------------------------------------------------
 
-enum activate_states {
-    ACTIVATE_READ_AND_NOP,
-    ACTIVATE_ENABLE_CHIP,
-    ACTIVATE_NOP,
-    ACTIVATE_CHECK_FW_VER,
-    ACTIVATE_CHECK_PSK,
-    ACTIVATE_RESET,
-    ACTIVATE_OTP,
-    ACTIVATE_SET_MCU_IDLE,
-    ACTIVATE_SET_MCU_CONFIG,
-    ACTIVATE_NUM_STATES,
-};
-
-static void check_none(FpDevice *dev, gpointer user_data, GError *error) {
-  if (error) {
-    fpi_ssm_mark_failed(user_data, error);
-    return;
-  }
-
-  fpi_ssm_next_state(user_data);
+static void check_none(FpDevice* dev, gpointer user_data, GError* error)
+{
+    if (error) {
+        fpi_ssm_mark_failed(user_data, error);
+        return;
+    }
+    fpi_ssm_next_state(user_data);
 }
 
-static void check_firmware_version(FpDevice *dev, gchar *firmware,
-                                   gpointer user_data, GError *error) {
-  if (error) {
-    fpi_ssm_mark_failed(user_data, error);
-    return;
-  }
-
-  fp_dbg("Device firmware: \"%s\"", firmware);
-
-  if (strcmp(firmware, GOODIX_53XD_FIRMWARE_VERSION)) {
-    g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-                "Invalid device firmware: \"%s\"", firmware);
-    fpi_ssm_mark_failed(user_data, error);
-    return;
-  }
-
-  fpi_ssm_next_state(user_data);
+static void check_none_cmd(FpDevice* dev, guint8* data, guint16 len,
+                           gpointer ssm, GError* err)
+{
+    if (err) {
+        fpi_ssm_mark_failed(ssm, err);
+        return;
+    }
+    fpi_ssm_next_state(ssm);
 }
 
-static void check_reset(FpDevice *dev, gboolean success, guint16 number,
-                        gpointer user_data, GError *error) {
-  if (error) {
-    fpi_ssm_mark_failed(user_data, error);
-    return;
-  }
+static void check_firmware_version(FpDevice* dev, gchar* firmware,
+                                   gpointer user_data, GError* error)
+{
+    if (error) {
+        fpi_ssm_mark_failed(user_data, error);
+        return;
+    }
 
-  if (!success) {
-    g_set_error(&error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                "Failed to reset device");
-    fpi_ssm_mark_failed(user_data, error);
-    return;
-  }
+    fp_dbg("Device firmware: \"%s\"", firmware);
 
-  fp_dbg("Device reset number: %d", number);
+    if (strcmp(firmware, GOODIX_53XD_FIRMWARE_VERSION)) {
+        g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                    "Invalid device firmware: \"%s\"", firmware);
+        fpi_ssm_mark_failed(user_data, error);
+        return;
+    }
 
-  if (number != GOODIX_53XD_RESET_NUMBER) {
-    g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-                "Invalid device reset number: %d", number);
-    fpi_ssm_mark_failed(user_data, error);
-    return;
-  }
-
-  fpi_ssm_next_state(user_data);
+    fpi_ssm_next_state(user_data);
 }
 
-static void check_preset_psk_read(FpDevice *dev, gboolean success,
-                                  guint32 flags, guint8 *psk, guint16 length,
-                                  gpointer user_data, GError *error) {
-  g_autofree gchar *psk_str = data_to_str(psk, length);
+static void check_reset(FpDevice* dev, gboolean success, guint16 number,
+                        gpointer user_data, GError* error)
+{
+    if (error) {
+        fpi_ssm_mark_failed(user_data, error);
+        return;
+    }
 
-  if (error) {
-    fpi_ssm_mark_failed(user_data, error);
-    return;
-  }
+    if (!success) {
+        g_set_error(&error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                    "Failed to reset device");
+        fpi_ssm_mark_failed(user_data, error);
+        return;
+    }
 
-  if (!success) {
-    g_set_error(&error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                "Failed to read PSK from device");
-    fpi_ssm_mark_failed(user_data, error);
-    return;
-  }
+    fp_dbg("Device reset number: %d", number);
 
-  fp_dbg("Device PSK: 0x%s", psk_str);
-  fp_dbg("Device PSK flags: 0x%08x", flags);
+    if (number != GOODIX_53XD_RESET_NUMBER) {
+        g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                    "Invalid device reset number: %d", number);
+        fpi_ssm_mark_failed(user_data, error);
+        return;
+    }
 
-  if (flags != GOODIX_53XD_PSK_FLAGS) {
-    g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-                "Invalid device PSK flags: 0x%08x", flags);
-    fpi_ssm_mark_failed(user_data, error);
-    return;
-  }
-
-  if (length != sizeof(goodix_53xd_psk_0)) {
-    g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-                "Invalid device PSK: 0x%s", psk_str);
-    fpi_ssm_mark_failed(user_data, error);
-    return;
-  }
-
-  if (memcmp(psk, goodix_53xd_psk_0, sizeof(goodix_53xd_psk_0))) {
-    g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
-                "Invalid device PSK: 0x%s", psk_str);
-    fpi_ssm_mark_failed(user_data, error);
-    return;
-  }
-
-  fpi_ssm_next_state(user_data);
+    fpi_ssm_next_state(user_data);
 }
+
+static void check_preset_psk_read(FpDevice* dev, gboolean success,
+                                  guint32 flags, guint8* psk, guint16 length,
+                                  gpointer user_data, GError* error)
+{
+    g_autofree gchar* psk_str = data_to_str(psk, length);
+
+    if (error) {
+        fpi_ssm_mark_failed(user_data, error);
+        return;
+    }
+
+    if (!success) {
+        g_set_error(&error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                    "Failed to read PSK from device");
+        fpi_ssm_mark_failed(user_data, error);
+        return;
+    }
+
+    fp_dbg("Device PSK: 0x%s", psk_str);
+    fp_dbg("Device PSK flags: 0x%08x", flags);
+
+    if (flags != GOODIX_53XD_PSK_FLAGS) {
+        g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                    "Invalid device PSK flags: 0x%08x", flags);
+        fpi_ssm_mark_failed(user_data, error);
+        return;
+    }
+
+    if (length != sizeof(goodix_53xd_psk_0)) {
+        g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                    "Invalid device PSK: 0x%s", psk_str);
+        fpi_ssm_mark_failed(user_data, error);
+        return;
+    }
+
+    if (memcmp(psk, goodix_53xd_psk_0, sizeof(goodix_53xd_psk_0))) {
+        g_set_error(&error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                    "Invalid device PSK: 0x%s", psk_str);
+        fpi_ssm_mark_failed(user_data, error);
+        return;
+    }
+
+    fpi_ssm_next_state(user_data);
+}
+
 static void check_idle(FpDevice* dev, gpointer user_data, GError* err)
 {
-
     if (err) {
         fpi_ssm_mark_failed(user_data, err);
         return;
     }
     fpi_ssm_next_state(user_data);
 }
+
 static void check_config_upload(FpDevice* dev, gboolean success,
                                 gpointer user_data, GError* error)
 {
@@ -206,46 +236,6 @@ static void check_config_upload(FpDevice* dev, gboolean success,
         fpi_ssm_next_state(user_data);
     }
 }
-G_GNUC_UNUSED static void check_powerdown_scan_freq(FpDevice* dev, gboolean success,
-                                      gpointer user_data, GError* error)
-{
-    if (error) {
-        fpi_ssm_mark_failed(user_data, error);
-    }
-    else if (!success) {
-        fpi_ssm_mark_failed(user_data,
-                            g_error_new(FP_DEVICE_ERROR, FP_DEVICE_ERROR_PROTO,
-                                        "failed to set powerdown freq"));
-    }
-    fpi_ssm_next_state(user_data);
-}
-
-enum otp_write_states {
-    OTP_WRITE_1,
-    OTP_WRITE_2,
-
-    OTP_WRITE_NUM,
-};
-
-G_GNUC_UNUSED static void otp_write_run(FpiSsm* ssm, FpDevice* dev)
-{
-    /*FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
-    switch (fpi_ssm_get_cur_state(ssm)) {
-    case OTP_WRITE_1:
-        guint8 sensor1[] = {0x0a, 0x02};
-        goodix_send_write_sensor_register(
-        dev, 0x022c, sensor1, check_none,
-        ssm);
-        break;
-    case OTP_WRITE_2:
-        guint8 sensor2[] = {0x0a, 0x03};
-        goodix_send_write_sensor_register(
-            dev, 0x022c, sensor2, check_none,
-            ssm);
-        fpi_ssm_next_state(ssm);
-        break;
-    }*/
-}
 
 static void read_otp_callback(FpDevice* dev, guint8* data, guint16 len,
                               gpointer ssm, GError* err)
@@ -257,120 +247,104 @@ static void read_otp_callback(FpDevice* dev, guint8* data, guint16 len,
     if (len < 64) {
         fpi_ssm_mark_failed(ssm, g_error_new(FP_DEVICE_ERROR,
                                              FP_DEVICE_ERROR_DATA_INVALID,
-                                             "OTP is invalid (len: %d)", 64));
+                                             "OTP is invalid (len: %d)", len));
         return;
     }
     FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
-    self->otp = malloc(64);
-    memcpy(self->otp, data, len);
+    g_clear_pointer(&self->otp, g_free);
+    self->otp = g_malloc(64);
+    memcpy(self->otp, data, 64);
     fpi_ssm_next_state(ssm);
 }
 
-static void activate_run_state(FpiSsm* ssm, FpDevice* dev)
-{
+// ---------------------------------------------------------------------------
+// Open SSM: claim + activation + TLS handshake
+// ---------------------------------------------------------------------------
 
+enum open_states {
+    OPEN_READ_AND_NOP,
+    OPEN_ENABLE_CHIP,
+    OPEN_NOP,
+    OPEN_CHECK_FW_VER,
+    OPEN_CHECK_PSK,
+    OPEN_RESET,
+    OPEN_OTP,
+    OPEN_SET_MCU_IDLE,
+    OPEN_SET_MCU_CONFIG,
+    OPEN_TLS,
+    OPEN_NUM_STATES,
+};
+
+static void open_tls_complete(FpDevice* dev, gpointer ssm, GError* error)
+{
+    if (error) {
+        fpi_ssm_mark_failed(ssm, error);
+        return;
+    }
+    fpi_ssm_next_state(ssm);
+}
+
+static void open_run_state(FpiSsm* ssm, FpDevice* dev)
+{
     switch (fpi_ssm_get_cur_state(ssm)) {
-    case ACTIVATE_READ_AND_NOP:
-        // Nop seems to clear the previous command buffer. But we are
-        // unable to do so.
+    case OPEN_READ_AND_NOP:
+        // Nop seems to clear the previous command buffer.
         goodix_start_read_loop(dev);
         goodix_send_nop(dev, check_none, ssm);
         break;
 
-    case ACTIVATE_ENABLE_CHIP:
-      goodix_send_enable_chip(dev, TRUE, check_none, ssm);
-      break;
+    case OPEN_ENABLE_CHIP:
+        goodix_send_enable_chip(dev, TRUE, check_none, ssm);
+        break;
 
-    case ACTIVATE_NOP:
-      goodix_send_nop(dev, check_none, ssm);
-      break;
+    case OPEN_NOP:
+        goodix_send_nop(dev, check_none, ssm);
+        break;
 
-    case ACTIVATE_CHECK_FW_VER:
-      goodix_send_firmware_version(dev, check_firmware_version, ssm);
-      break;
+    case OPEN_CHECK_FW_VER:
+        goodix_send_firmware_version(dev, check_firmware_version, ssm);
+        break;
 
-    case ACTIVATE_CHECK_PSK:
-      goodix_send_preset_psk_read(dev, GOODIX_53XD_PSK_FLAGS, 32,
-                                  check_preset_psk_read, ssm);
-      break;
+    case OPEN_CHECK_PSK:
+        goodix_send_preset_psk_read(dev, GOODIX_53XD_PSK_FLAGS, 32,
+                                    check_preset_psk_read, ssm);
+        break;
 
-    case ACTIVATE_RESET:
-      goodix_send_reset(dev, TRUE, 20, check_reset, ssm);
-      break;
+    case OPEN_RESET:
+        goodix_send_reset(dev, TRUE, 20, check_reset, ssm);
+        break;
 
-    case ACTIVATE_OTP:
-      goodix_send_read_otp(dev, read_otp_callback, ssm);
-      break;
+    case OPEN_OTP:
+        goodix_send_read_otp(dev, read_otp_callback, ssm);
+        break;
 
-    case ACTIVATE_SET_MCU_IDLE:
+    case OPEN_SET_MCU_IDLE:
         goodix_send_mcu_switch_to_idle_mode(dev, 20, check_idle, ssm);
         break;
 
-    case ACTIVATE_SET_MCU_CONFIG:
+    case OPEN_SET_MCU_CONFIG:
         goodix_send_upload_config_mcu(dev, goodix_53xd_config,
                                       sizeof(goodix_53xd_config), NULL,
                                       check_config_upload, ssm);
         break;
+
+    case OPEN_TLS:
+        goodix_tls(dev, open_tls_complete, ssm);
+        break;
     }
 }
 
-static void tls_activation_complete(FpDevice* dev, gpointer user_data,
-                                    GError* error)
+static void open_ssm_done(FpiSsm* ssm, FpDevice* dev, GError* error)
 {
-    if (error) {
-        fp_err("failed to complete tls activation: %s", error->message);
-        return;
-    }
-    FpImageDevice* image_dev = FP_IMAGE_DEVICE(dev);
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
 
-    fpi_image_device_activate_complete(image_dev, error);
+    self->task_ssm = NULL;
+    fpi_device_open_complete(dev, error);
 }
 
-static void activate_complete(FpiSsm* ssm, FpDevice* dev, GError* error)
-{
-    G_DEBUG_HERE();
-    if (!error)
-        goodix_tls(dev, tls_activation_complete, NULL);
-    else {
-        fp_err("failed during activation: %s (code: %d)", error->message,
-               error->code);
-        fpi_image_device_activate_complete(FP_IMAGE_DEVICE(dev), error);
-    }
-}
-
-// ---- ACTIVE SECTION END ----
-
-// -----------------------------------------------------------------------------
-
-// ---- SCAN SECTION START ----
-
-enum SCAN_STAGES {
-    SCAN_STAGE_SWITCH_TO_FDT_DOWN,
-    SCAN_STAGE_SWITCH_TO_FDT_MODE,
-    SCAN_STAGE_GET_IMG,
-
-    SCAN_STAGE_NUM,
-};
-
-static void check_none_cmd(FpDevice* dev, guint8* data, guint16 len,
-                           gpointer ssm, GError* err)
-{
-    if (err) {
-        fpi_ssm_mark_failed(ssm, err);
-        return;
-    }
-    fpi_ssm_next_state(ssm);
-}
-
-static unsigned char get_pix(struct fpi_frame_asmbl_ctx* ctx,
-                             struct fpi_frame* frame, unsigned int x,
-                             unsigned int y)
-{
-    return frame->data[x + y * GOODIX53XD_WIDTH];
-}
-
-// Bitdepth is 12, but we have to fit it in a byte
-static unsigned char squash(int v) { return v / 16; }
+// ---------------------------------------------------------------------------
+// Image decoding (12-bit raw -> 8-bit grayscale)
+// ---------------------------------------------------------------------------
 
 static void decode_frame(Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE],
                          const guint8* raw_frame)
@@ -392,37 +366,9 @@ static void decode_frame(Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE],
         }
     }
 }
-G_GNUC_UNUSED static int goodix_cmp_short(const void* a, const void* b)
-{
-    return (int) (*(short*) a - *(short*) b);
-}
 
-G_GNUC_UNUSED static void rotate_frame(Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE])
-{
-    Goodix53xdPix buff[GOODIX53XD_FRAME_SIZE];
-
-    for (int y = 0; y != GOODIX53XD_HEIGHT; ++y) {
-        for (int x = 0; x != GOODIX53XD_WIDTH; ++x) {
-            buff[x * GOODIX53XD_WIDTH + y] = frame[x + y * GOODIX53XD_WIDTH];
-        }
-    }
-    memcpy(frame, buff, GOODIX53XD_FRAME_SIZE);
-}
-G_GNUC_UNUSED static void squash_frame(Goodix53xdPix* frame, guint8* squashed)
-{
-    for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i) {
-        squashed[i] = squash(frame[i]);
-    }
-}
-/**
- * @brief Squashes the 12 bit pixels of a raw frame into the 4 bit pixels used
- * by libfprint.
- * @details Borrowed from the elan driver. We reduce frames to
- * within the max and min.
- *
- * @param frame
- * @param squashed
- */
+// Borrowed from the elan driver: stretch the 12-bit pixels into the 8-bit
+// range based on the per-frame min/max.
 static void squash_frame_linear(Goodix53xdPix* frame, guint8* squashed)
 {
     Goodix53xdPix min = 0xffff;
@@ -430,359 +376,597 @@ static void squash_frame_linear(Goodix53xdPix* frame, guint8* squashed)
 
     for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i) {
         const Goodix53xdPix pix = frame[i];
-        if (pix < min) {
+        if (pix < min)
             min = pix;
-        }
-        if (pix > max) {
+        if (pix > max)
             max = pix;
-        }
     }
 
     for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i) {
         const Goodix53xdPix pix = frame[i];
-        if (pix - min == 0 || max - min == 0) {
+        if (pix - min == 0 || max - min == 0)
             squashed[i] = 0;
-        }
-        else {
+        else
             squashed[i] = (pix - min) * 0xff / (max - min);
-        }
     }
 }
 
-/**
- * @brief Subtracts the background from the frame
- *
- * @param frame
- * @param background
- */
-G_GNUC_UNUSED static gboolean postprocess_frame(Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE],
-                                  Goodix53xdPix background[GOODIX53XD_FRAME_SIZE])
-{
-    int sum = 0;
-    for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i) {
-        Goodix53xdPix* og_px = frame + i;
-        Goodix53xdPix bg_px =  background[i];
-            if (bg_px > *og_px) {
-                *og_px = 0;
-            }
-            else {
-                *og_px -= bg_px;
-            }
-            *og_px = MAX(bg_px - *og_px, 0);
-            *og_px = MAX(*og_px - bg_px, 0);
-            sum += *og_px;
-            
-    }
-    if (sum == 0) {
-        fp_warn("frame darker than background, finger on scanner during "
-                "calibration?");
-    }
-    return sum != 0;
-}
+// ---------------------------------------------------------------------------
+// Capture sub-SSM: wait for finger (FDT down) + read one image
+// ---------------------------------------------------------------------------
 
-typedef struct _frame_processing_info {
-    FpiDeviceGoodixTls53XD* dev;
-    GSList** frames;
+static const guint8 fdt_switch_state_mode_53xd[] = {
+    0x0d, 0x01, 0x28, 0x01, 0x22, 0x01, 0x28, 0x01,
+    0x24, 0x01, 0x91, 0x91, 0x8b, 0x8b, 0x96, 0x96,
+    0x91, 0x91, 0x98, 0x98, 0x90, 0x90, 0x92, 0x92,
+    0x88, 0x88, 0x00};
 
-} frame_processing_info;
+enum capture_states {
+    CAPTURE_FDT_DOWN,
+    CAPTURE_FDT_MODE,
+    CAPTURE_WRITE_REG,
+    CAPTURE_GET_IMG,
+    CAPTURE_NUM_STATES,
+};
 
-static void process_frame(Goodix53xdPix* raw_frame, frame_processing_info* info)
-{
-    struct fpi_frame* frame =
-        g_malloc(GOODIX53XD_FRAME_SIZE + sizeof(struct fpi_frame));
-    //postprocess_frame(raw_frame, info->dev->empty_img);
-    squash_frame_linear(raw_frame, frame->data);
+static void capture_fdt_down_arm(FpDevice* dev, FpiSsm* ssm);
 
-    *(info->frames) = g_slist_append(*(info->frames), frame);
-}
-
-static void save_frame(FpiDeviceGoodixTls53XD* self, guint8* raw)
-{
-    Goodix53xdPix* frame = malloc(GOODIX53XD_FRAME_SIZE * sizeof(Goodix53xdPix));
-    decode_frame(frame, raw);
-    self->frames = g_slist_append(self->frames, frame);
-}
-
-static void scan_on_read_img(FpDevice* dev, guint8* data, guint16 len,
+static void on_capture_image(FpDevice* dev, guint8* data, guint16 len,
                              gpointer ssm, GError* err)
 {
     if (err) {
         fpi_ssm_mark_failed(ssm, err);
         return;
     }
-
-
-    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
-    save_frame(self, data);
-    if (g_slist_length(self->frames) <= GOODIX53XD_CAP_FRAMES) {
-        fpi_ssm_jump_to_state(ssm, SCAN_STAGE_SWITCH_TO_FDT_MODE);
-    }
-    else {
-        GSList* raw_frames = g_slist_nth(self->frames, 1);
-
-        FpImageDevice* img_dev = FP_IMAGE_DEVICE(dev);
-        struct fpi_frame_asmbl_ctx assembly_ctx;
-        assembly_ctx.frame_width = GOODIX53XD_WIDTH;
-        assembly_ctx.frame_height = GOODIX53XD_HEIGHT;
-        assembly_ctx.image_width = GOODIX53XD_WIDTH*3;
-        assembly_ctx.get_pixel = get_pix;
-
-        GSList* frames = NULL;
-        frame_processing_info pinfo = {.dev = self, .frames = &frames};
-
-        g_slist_foreach(raw_frames, (GFunc) process_frame, &pinfo);
-        frames = g_slist_reverse(frames);
-
-        fpi_do_movement_estimation(&assembly_ctx, frames);
-        FpImage* img = fpi_assemble_frames(&assembly_ctx, frames);
-
-        g_slist_free_full(frames, g_free);
-        g_slist_free_full(self->frames, g_free);
-        self->frames = g_slist_alloc();
-
-        fpi_image_device_image_captured(img_dev, img);
-
-
-        fpi_image_device_report_finger_status(img_dev, FALSE);
-
-        fpi_ssm_next_state(ssm);
-    }
-}
-
-enum scan_empty_img_state {
-    SCAN_EMPTY_NAV0,
-    SCAN_EMPTY_GET_IMG,
-
-    SCAN_EMPTY_NUM,
-};
-
-static void on_scan_empty_img(FpDevice* dev, guint8* data, guint16 length,
-                              gpointer ssm, GError* error)
-{
-    if (error) {
-        fpi_ssm_mark_failed(ssm, error);
+    if (len < GOODIX53XD_RAW_FRAME_SIZE) {
+        fpi_ssm_mark_failed(ssm, g_error_new(FP_DEVICE_ERROR,
+                                             FP_DEVICE_ERROR_DATA_INVALID,
+                                             "short image frame (len %d)", len));
         return;
     }
+
     FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
-    decode_frame(self->empty_img, data);
+    Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE];
+    decode_frame(frame, data);
+
+    g_clear_pointer(&self->captured_image, g_free);
+    self->captured_image = g_malloc(GOODIX53XD_SENSOR_PIXELS);
+    squash_frame_linear(frame, self->captured_image);
+
+    fpi_ssm_mark_completed(ssm);
+}
+
+static void capture_get_img(FpDevice* dev, FpiSsm* ssm)
+{
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+    guint8 payload[] = {0x41,           0x03, self->otp[26], 0x00,
+                        self->otp[26] - 6, 0x00, self->otp[45], 0x00,
+                        self->otp[45] - 4, 0x00};
+    goodix_tls_read_image(dev, payload, sizeof(payload), on_capture_image, ssm);
+}
+
+// FDT-down calibration sequence, patched per-OTP. The first arm carries no
+// reply; the second blocks until the device reports the finger-down event.
+static void on_fdt_down_second(FpDevice* dev, guint8* data, guint16 len,
+                               gpointer ssm, GError* err)
+{
+    if (err) {
+        // Treat a transfer timeout as "no finger yet" and re-arm so the user
+        // gets more than one USB timeout window to press. (Needs hardware
+        // tuning; a real finger-up/finger-down FDT event would be cleaner.)
+        if (g_error_matches(err, G_USB_DEVICE_ERROR,
+                            G_USB_DEVICE_ERROR_TIMED_OUT)) {
+            g_clear_error(&err);
+            capture_fdt_down_arm(dev, ssm);
+            return;
+        }
+        fpi_ssm_mark_failed(ssm, err);
+        return;
+    }
+    // Finger detected -> advance the capture SSM.
     fpi_ssm_next_state(ssm);
 }
-static void scan_empty_run(FpiSsm* ssm, FpDevice* dev)
-{
 
-    switch (fpi_ssm_get_cur_state(ssm)) {
-    case SCAN_EMPTY_NAV0:
-        goodix_send_nav_0(dev, check_none_cmd, ssm);
-        break;
-
-    case SCAN_EMPTY_GET_IMG: {
-        FpImageDevice* img_dev = FP_IMAGE_DEVICE(dev);
-        FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(img_dev);
-        guint8 payload[] = {0x41, 0x03, self->otp[26], 0x00, self->otp[26] - 6, 0x00, self->otp[45], 0x00, self->otp[45] - 4, 0x00};
-        goodix_tls_read_image(dev, payload, sizeof(payload), on_scan_empty_img, ssm);
-        break;
-    }
-    }
-}
-
-G_GNUC_UNUSED static void scan_empty_img(FpDevice* dev, FpiSsm* ssm)
-{
-    fpi_ssm_start_subsm(ssm, fpi_ssm_new(dev, scan_empty_run, SCAN_EMPTY_NUM));
-}
-
-static void scan_get_img(FpDevice* dev, FpiSsm* ssm)
-{
-    FpImageDevice* img_dev = FP_IMAGE_DEVICE(dev);
-    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(img_dev);
-    guint8 payload[] = {0x41, 0x03, self->otp[26], 0x00, self->otp[26] - 6, 0x00, self->otp[45], 0x00, self->otp[45] - 4, 0x00};
-    goodix_tls_read_image(dev, payload, sizeof(payload), scan_on_read_img, ssm);
-}
-
-const guint8 fdt_switch_state_mode_53xd[] = {
-    0x0d, 0x01, 0x28, 0x01, 0x22, 0x01, 0x28, 0x01,
-    0x24, 0x01, 0x91, 0x91, 0x8b, 0x8b, 0x96, 0x96,
-    0x91, 0x91, 0x98, 0x98, 0x90, 0x90, 0x92, 0x92,
-    0x88, 0x88, 0x00
-};
-
-guint8 fdt_switch_state_down_53xd[] = {
-    0x8c, 0x01, 0x28, 0x01, 0x22, 0x01, 0x28, 0x01,
-    0x24, 0x01, 0x91, 0x91, 0x8b, 0x8b, 0x96, 0x96,
-    0x91, 0x91, 0x98, 0x98, 0x90, 0x90, 0x92, 0x92,
-    0x88, 0x88, 0x00
-};
-
-static void scan_run_state(FpiSsm* ssm, FpDevice* dev)
-{
-    FpImageDevice* img_dev = FP_IMAGE_DEVICE(dev);
-    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(img_dev);
-
-
-    switch (fpi_ssm_get_cur_state(ssm)) {
-
-    case SCAN_STAGE_SWITCH_TO_FDT_MODE:
-        goodix_send_mcu_switch_to_fdt_mode(dev, (guint8*) fdt_switch_state_mode_53xd,
-                                           sizeof(fdt_switch_state_mode_53xd), FALSE, NULL,
-                                           check_none_cmd, ssm);
-        break;
-
-    case SCAN_STAGE_SWITCH_TO_FDT_DOWN:
-        // FDT Down Cali
-        fdt_switch_state_down_53xd[2] = self->otp[33];
-        fdt_switch_state_down_53xd[4] = self->otp[41];
-        fdt_switch_state_down_53xd[6] = self->otp[42];
-        fdt_switch_state_down_53xd[8] = self->otp[43];
-
-        // First FDT down must not send a reply
-        fdt_switch_state_down_53xd[26] = 0x00;
-        goodix_send_mcu_switch_to_fdt_down(dev, (guint8*) fdt_switch_state_down_53xd,
-                                           sizeof(fdt_switch_state_down_53xd), FALSE, NULL,
-                                           receive_fdt_down_ack, ssm);
-        break;
-    case SCAN_STAGE_GET_IMG:
-        fpi_image_device_report_finger_status(img_dev, TRUE);
-        /* Write reg 0x022c (556) <- bytes {0x05, 0x03}. The packed value
-         * field serialises little-endian, so 0x0305 produces those bytes on
-         * the wire. Confirmed against goodix-fp-dump driver_53xd.py (the
-         * original {0x05, 0x03} brace-init of a scalar silently dropped the
-         * second byte). */
-        guint16 payload = 0x0305;
-        goodix_send_write_sensor_register(dev, 556, payload, write_sensor_complete, ssm);
-        break;
-    }
-}
-
-static void receive_fdt_down_ack(FpDevice* dev, guint8* data, guint16 len,
-                           gpointer ssm, GError* err)
+static void on_fdt_down_first(FpDevice* dev, guint8* data, guint16 len,
+                              gpointer ssm, GError* err)
 {
     if (err) {
         fpi_ssm_mark_failed(ssm, err);
         return;
     }
 
-    // Second FDT down must send a response
-    fdt_switch_state_down_53xd[26] = 0x01;
-    goodix_send_mcu_switch_to_fdt_down(dev, (guint8*) fdt_switch_state_down_53xd,
-                                        sizeof(fdt_switch_state_down_53xd), TRUE, NULL,
-                                        check_none_cmd, ssm);
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+    guint8 seq[] = {0x8c, 0x01, self->otp[33], 0x01, self->otp[41], 0x01,
+                    self->otp[42], 0x01, self->otp[43], 0x01, 0x91, 0x91,
+                    0x8b, 0x8b, 0x96, 0x96, 0x91, 0x91, 0x98, 0x98, 0x90,
+                    0x90, 0x92, 0x92, 0x88, 0x88, 0x01};
+    // Second arm asks for a reply: blocks until the finger-down event fires.
+    goodix_send_mcu_switch_to_fdt_down(dev, seq, sizeof(seq), TRUE, NULL,
+                                       on_fdt_down_second, ssm);
 }
 
-static void write_sensor_complete(FpDevice *dev, gpointer user_data, GError *error) 
+static void capture_fdt_down_arm(FpDevice* dev, FpiSsm* ssm)
 {
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+    guint8 seq[] = {0x8c, 0x01, self->otp[33], 0x01, self->otp[41], 0x01,
+                    self->otp[42], 0x01, self->otp[43], 0x01, 0x91, 0x91,
+                    0x8b, 0x8b, 0x96, 0x96, 0x91, 0x91, 0x98, 0x98, 0x90,
+                    0x90, 0x92, 0x92, 0x88, 0x88, 0x00};
+    // First arm: no reply.
+    goodix_send_mcu_switch_to_fdt_down(dev, seq, sizeof(seq), FALSE, NULL,
+                                       on_fdt_down_first, ssm);
+}
+
+static void capture_run_state(FpiSsm* ssm, FpDevice* dev)
+{
+    switch (fpi_ssm_get_cur_state(ssm)) {
+    case CAPTURE_FDT_DOWN:
+        capture_fdt_down_arm(dev, ssm);
+        break;
+
+    case CAPTURE_FDT_MODE:
+        goodix_send_mcu_switch_to_fdt_mode(dev,
+                                           (guint8*) fdt_switch_state_mode_53xd,
+                                           sizeof(fdt_switch_state_mode_53xd),
+                                           FALSE, NULL, check_none_cmd, ssm);
+        break;
+
+    case CAPTURE_WRITE_REG:
+        // Write reg 0x022c (556) <- bytes {0x05, 0x03} (value 0x0305, LE);
+        // confirmed against goodix-fp-dump driver_53xd.py before image read.
+        goodix_send_write_sensor_register(dev, 556, 0x0305, check_none, ssm);
+        break;
+
+    case CAPTURE_GET_IMG:
+        capture_get_img(dev, ssm);
+        break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Finger-up sub-SSM (best-effort debounce delay)
+// ---------------------------------------------------------------------------
+
+enum finger_up_states {
+    FINGER_UP_WAIT,
+    FINGER_UP_NUM_STATES,
+};
+
+static void finger_up_timeout(FpDevice* dev, gpointer ssm)
+{
+    fpi_ssm_next_state(ssm);
+}
+
+static void finger_up_run_state(FpiSsm* ssm, FpDevice* dev)
+{
+    switch (fpi_ssm_get_cur_state(ssm)) {
+    case FINGER_UP_WAIT:
+        fpi_device_add_timeout(dev, GOODIX53XD_FINGER_UP_DELAY_MS,
+                               finger_up_timeout, ssm, NULL);
+        break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Enroll SSM
+// ---------------------------------------------------------------------------
+
+enum enroll_states {
+    ENROLL_CAPTURE,
+    ENROLL_PROCESS,
+    ENROLL_WAIT_FINGER_UP,
+    ENROLL_NEXT,
+    ENROLL_NUM_STATES,
+};
+
+static void enroll_run_state(FpiSsm* ssm, FpDevice* dev)
+{
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+
+    switch (fpi_ssm_get_cur_state(ssm)) {
+    case ENROLL_CAPTURE: {
+        FpiSsm* sub = fpi_ssm_new(dev, capture_run_state, CAPTURE_NUM_STATES);
+        fpi_ssm_start_subsm(ssm, sub);
+        break;
+    }
+
+    case ENROLL_PROCESS: {
+        SigfmImgInfo* info = sigfm_extract(self->captured_image,
+                                           GOODIX53XD_WIDTH, GOODIX53XD_HEIGHT);
+        int keypoints = sigfm_keypoints_count(info);
+        sigfm_free_info(info);
+
+        if (keypoints < GOODIX53XD_MIN_CAPTURE_KEYPOINTS) {
+            g_clear_pointer(&self->captured_image, g_free);
+            fpi_device_enroll_progress(
+                dev, self->enroll_stage, NULL,
+                fpi_device_retry_new(FP_DEVICE_RETRY_REMOVE_FINGER));
+            fpi_ssm_next_state(ssm);
+            return;
+        }
+
+        g_ptr_array_add(self->enroll_images, self->captured_image);
+        self->captured_image = NULL;
+        self->enroll_stage++;
+
+        fp_dbg("Enrollment stage %d/%d complete", self->enroll_stage,
+               GOODIX53XD_ENROLL_SAMPLES);
+        fpi_device_enroll_progress(dev, self->enroll_stage, NULL, NULL);
+        fpi_ssm_next_state(ssm);
+        break;
+    }
+
+    case ENROLL_WAIT_FINGER_UP: {
+        FpiSsm* sub =
+            fpi_ssm_new(dev, finger_up_run_state, FINGER_UP_NUM_STATES);
+        fpi_ssm_start_subsm(ssm, sub);
+        break;
+    }
+
+    case ENROLL_NEXT:
+        if (self->enroll_stage < GOODIX53XD_ENROLL_SAMPLES)
+            fpi_ssm_jump_to_state(ssm, ENROLL_CAPTURE);
+        else
+            fpi_ssm_mark_completed(ssm);
+        break;
+    }
+}
+
+static void enroll_ssm_done(FpiSsm* ssm, FpDevice* dev, GError* error)
+{
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+
+    self->task_ssm = NULL;
+
     if (error) {
-        fp_err("failed to scan: %s (code: %d)", error->message, error->code);
+        g_clear_pointer(&self->enroll_images, g_ptr_array_unref);
+        g_clear_pointer(&self->captured_image, g_free);
+        fpi_device_enroll_complete(dev, NULL, error);
         return;
     }
-    scan_get_img(dev, user_data);
+
+    FpPrint* print = NULL;
+    fpi_device_get_enroll_data(dev, &print);
+    fpi_print_set_type(print, FPI_PRINT_RAW);
+
+    GVariantBuilder builder;
+    g_variant_builder_init(&builder, G_VARIANT_TYPE("aay"));
+    for (guint i = 0; i < self->enroll_images->len; i++) {
+        guint8* img = g_ptr_array_index(self->enroll_images, i);
+        g_variant_builder_add(
+            &builder, "@ay",
+            g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, img,
+                                      GOODIX53XD_SENSOR_PIXELS, 1));
+    }
+    GVariant* data = g_variant_builder_end(&builder);
+    g_object_set(G_OBJECT(print), "fpi-data", data, NULL);
+
+    g_clear_pointer(&self->enroll_images, g_ptr_array_unref);
+
+    fp_info("Enrollment complete with %d samples", GOODIX53XD_ENROLL_SAMPLES);
+    fpi_device_enroll_complete(dev, g_object_ref(print), NULL);
 }
 
-static void scan_complete(FpiSsm* ssm, FpDevice* dev, GError* error)
+// ---------------------------------------------------------------------------
+// Verify / Identify SSM
+// ---------------------------------------------------------------------------
+
+static void clear_pending_result(FpiDeviceGoodixTls53XD* self)
 {
-    if (error) {
-        fp_err("failed to scan: %s (code: %d)", error->message, error->code);
+    self->pending_result_report = FALSE;
+    self->pending_result_action = 0;
+    self->pending_verify_result = 0;
+    g_clear_object(&self->pending_identify_match);
+    g_clear_error(&self->pending_result_error);
+}
+
+static void queue_verify_report(FpiDeviceGoodixTls53XD* self,
+                                FpiMatchResult result, GError* error)
+{
+    clear_pending_result(self);
+    self->pending_result_report = TRUE;
+    self->pending_result_action = FPI_DEVICE_ACTION_VERIFY;
+    self->pending_verify_result = result;
+    self->pending_result_error = error;
+}
+
+static void queue_identify_report(FpiDeviceGoodixTls53XD* self, FpPrint* match,
+                                  GError* error)
+{
+    clear_pending_result(self);
+    self->pending_result_report = TRUE;
+    self->pending_result_action = FPI_DEVICE_ACTION_IDENTIFY;
+    if (match != NULL)
+        self->pending_identify_match = g_object_ref(match);
+    self->pending_result_error = error;
+}
+
+static void flush_pending_result(FpDevice* dev)
+{
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+
+    if (!self->pending_result_report)
         return;
+
+    self->action_result_reported = TRUE;
+
+    if (self->pending_result_action == FPI_DEVICE_ACTION_IDENTIFY) {
+        g_autoptr(FpPrint) match = g_steal_pointer(&self->pending_identify_match);
+        fpi_device_identify_report(dev, match, NULL,
+                                   g_steal_pointer(&self->pending_result_error));
     }
-    fp_dbg("finished scan");
+    else {
+        fpi_device_verify_report(dev, self->pending_verify_result, NULL,
+                                 g_steal_pointer(&self->pending_result_error));
+    }
+
+    self->pending_result_report = FALSE;
+    self->pending_result_action = 0;
+    self->pending_verify_result = 0;
 }
 
-static void scan_start(FpiDeviceGoodixTls53XD* dev)
+// Match the probe against one stored template ("aay" of raw images), returning
+// the best per-sample SIGFM score.
+static int match_against_template(SigfmImgInfo* probe, GVariant* tmpl_data)
 {
-    fpi_ssm_start(fpi_ssm_new(FP_DEVICE(dev), scan_run_state, SCAN_STAGE_NUM),
-                  scan_complete);
+    int best = 0;
+    GVariantIter iter;
+    GVariant* child;
+
+    g_variant_iter_init(&iter, tmpl_data);
+    while ((child = g_variant_iter_next_value(&iter))) {
+        gsize len;
+        const guint8* img = g_variant_get_fixed_array(child, &len, 1);
+        if (len == GOODIX53XD_SENSOR_PIXELS) {
+            SigfmImgInfo* tmpl_info =
+                sigfm_extract(img, GOODIX53XD_WIDTH, GOODIX53XD_HEIGHT);
+            int score = sigfm_match_score(probe, tmpl_info);
+            sigfm_free_info(tmpl_info);
+            if (score > best)
+                best = score;
+        }
+        g_variant_unref(child);
+    }
+    return best;
 }
 
-// ---- SCAN SECTION END ----
+enum verify_states {
+    VERIFY_CAPTURE,
+    VERIFY_MATCH,
+    VERIFY_FINISH,
+    VERIFY_NUM_STATES,
+};
 
-// ---- DEV SECTION START ----
-
-static void dev_init(FpImageDevice *img_dev) {
-  FpDevice *dev = FP_DEVICE(img_dev);
-  GError *error = NULL;
-
-  if (goodix_dev_init(dev, &error)) {
-    fpi_image_device_open_complete(img_dev, error);
-    return;
-  }
-
-  fpi_image_device_open_complete(img_dev, NULL);
-}
-
-static void dev_deinit(FpImageDevice *img_dev) {
-  FpDevice *dev = FP_DEVICE(img_dev);
-  GError *error = NULL;
-
-  if (goodix_dev_deinit(dev, &error)) {
-    fpi_image_device_close_complete(img_dev, error);
-    return;
-  }
-
-  fpi_image_device_close_complete(img_dev, NULL);
-}
-
-static void dev_activate(FpImageDevice *img_dev) {
-    FpDevice* dev = FP_DEVICE(img_dev);
-
-    fpi_ssm_start(fpi_ssm_new(dev, activate_run_state, ACTIVATE_NUM_STATES),
-                  activate_complete);
-}
-
-
-
-static void dev_change_state(FpImageDevice* img_dev, FpiImageDeviceState state)
+static void verify_run_state(FpiSsm* ssm, FpDevice* dev)
 {
-    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(img_dev);
-    G_DEBUG_HERE();
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
 
-    if (state == FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON) {
-        scan_start(self);
+    switch (fpi_ssm_get_cur_state(ssm)) {
+    case VERIFY_CAPTURE: {
+        FpiSsm* sub = fpi_ssm_new(dev, capture_run_state, CAPTURE_NUM_STATES);
+        fpi_ssm_start_subsm(ssm, sub);
+        break;
+    }
+
+    case VERIFY_MATCH: {
+        FpiDeviceAction action = fpi_device_get_current_action(dev);
+        SigfmImgInfo* probe = sigfm_extract(self->captured_image,
+                                            GOODIX53XD_WIDTH, GOODIX53XD_HEIGHT);
+        int keypoints = sigfm_keypoints_count(probe);
+
+        if (keypoints < GOODIX53XD_MIN_CAPTURE_KEYPOINTS) {
+            if (action == FPI_DEVICE_ACTION_IDENTIFY)
+                queue_identify_report(
+                    self, NULL,
+                    fpi_device_retry_new(FP_DEVICE_RETRY_REMOVE_FINGER));
+            else
+                queue_verify_report(
+                    self, FPI_MATCH_ERROR,
+                    fpi_device_retry_new(FP_DEVICE_RETRY_REMOVE_FINGER));
+
+            self->verify_wait_finger_up = TRUE;
+            sigfm_free_info(probe);
+            g_clear_pointer(&self->captured_image, g_free);
+            flush_pending_result(dev);
+            fpi_ssm_next_state(ssm);
+            return;
+        }
+
+        if (action == FPI_DEVICE_ACTION_IDENTIFY) {
+            GPtrArray* gallery = NULL;
+            FpPrint* match = NULL;
+            int best_score = 0;
+
+            fpi_device_get_identify_data(dev, &gallery);
+            for (guint i = 0; i < gallery->len; i++) {
+                FpPrint* tmpl = g_ptr_array_index(gallery, i);
+                GVariant* tmpl_data = NULL;
+                g_object_get(G_OBJECT(tmpl), "fpi-data", &tmpl_data, NULL);
+                if (tmpl_data == NULL)
+                    continue;
+                int score = match_against_template(probe, tmpl_data);
+                g_variant_unref(tmpl_data);
+                fp_dbg("identify: gallery[%u] sigfm best %d", i, score);
+                if (score >= GOODIX53XD_SIGFM_BEST_MIN && score > best_score) {
+                    best_score = score;
+                    match = tmpl;
+                }
+            }
+
+            if (match != NULL) {
+                queue_identify_report(self, match, NULL);
+                self->verify_wait_finger_up = FALSE;
+            }
+            else {
+                queue_identify_report(self, NULL, NULL);
+                self->verify_wait_finger_up = TRUE;
+            }
+        }
+        else {
+            FpPrint* print = NULL;
+            GVariant* data = NULL;
+            int best_score = 0;
+
+            fpi_device_get_verify_data(dev, &print);
+            g_object_get(G_OBJECT(print), "fpi-data", &data, NULL);
+            if (data != NULL) {
+                best_score = match_against_template(probe, data);
+                g_variant_unref(data);
+            }
+            fp_dbg("verify: best sigfm %d (min %d)", best_score,
+                   GOODIX53XD_SIGFM_BEST_MIN);
+
+            if (best_score >= GOODIX53XD_SIGFM_BEST_MIN) {
+                queue_verify_report(self, FPI_MATCH_SUCCESS, NULL);
+                self->verify_wait_finger_up = FALSE;
+            }
+            else {
+                queue_verify_report(self, FPI_MATCH_FAIL, NULL);
+                self->verify_wait_finger_up = TRUE;
+            }
+        }
+
+        sigfm_free_info(probe);
+        g_clear_pointer(&self->captured_image, g_free);
+
+        if (self->verify_wait_finger_up)
+            flush_pending_result(dev);
+
+        fpi_ssm_next_state(ssm);
+        break;
+    }
+
+    case VERIFY_FINISH:
+        if (self->verify_wait_finger_up) {
+            FpiSsm* sub =
+                fpi_ssm_new(dev, finger_up_run_state, FINGER_UP_NUM_STATES);
+            fpi_ssm_start_subsm(ssm, sub);
+        }
+        else {
+            fpi_ssm_mark_completed(ssm);
+        }
+        break;
     }
 }
 
-static void goodix53xd_reset_state(FpiDeviceGoodixTls53XD* self) {}
+static void verify_ssm_done(FpiSsm* ssm, FpDevice* dev, GError* error)
+{
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+    FpiDeviceAction action = fpi_device_get_current_action(dev);
 
-static void dev_deactivate(FpImageDevice *img_dev) {
-    FpDevice* dev = FP_DEVICE(img_dev);
-    goodix_reset_state(dev);
+    self->task_ssm = NULL;
+    g_clear_pointer(&self->captured_image, g_free);
+
+    if (error == NULL)
+        flush_pending_result(dev);
+    else
+        clear_pending_result(self);
+
+    self->action_result_reported = FALSE;
+    self->verify_wait_finger_up = FALSE;
+
+    if (action == FPI_DEVICE_ACTION_IDENTIFY)
+        fpi_device_identify_complete(dev, error);
+    else
+        fpi_device_verify_complete(dev, error);
+}
+
+// ---------------------------------------------------------------------------
+// FpDevice virtual methods
+// ---------------------------------------------------------------------------
+
+static void dev_open(FpDevice* dev)
+{
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
     GError* error = NULL;
-    goodix_shutdown_tls(dev, &error);
-    goodix53xd_reset_state(FPI_DEVICE_GOODIXTLS53XD(img_dev));
-    fpi_image_device_deactivate_complete(img_dev, error);
+
+    // goodix_dev_init() claims the USB interface; it returns TRUE on success.
+    if (!goodix_dev_init(dev, &error)) {
+        fpi_device_open_complete(dev, error);
+        return;
+    }
+
+    self->task_ssm = fpi_ssm_new(dev, open_run_state, OPEN_NUM_STATES);
+    fpi_ssm_start(self->task_ssm, open_ssm_done);
 }
 
-// ---- DEV SECTION END ----
-
-static void fpi_device_goodixtls53xd_init(FpiDeviceGoodixTls53XD* self)
+static void dev_close(FpDevice* dev)
 {
-    self->frames = g_slist_alloc();
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+    GError* error = NULL;
+
+    g_clear_pointer(&self->captured_image, g_free);
+    g_clear_pointer(&self->enroll_images, g_ptr_array_unref);
+    g_clear_pointer(&self->otp, g_free);
+    clear_pending_result(self);
+
+    goodix_reset_state(dev);
+    goodix_dev_deinit(dev, &error);
+    fpi_device_close_complete(dev, error);
 }
+
+static void dev_enroll(FpDevice* dev)
+{
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+
+    self->enroll_stage = 0;
+    g_clear_pointer(&self->enroll_images, g_ptr_array_unref);
+    self->enroll_images = g_ptr_array_new_with_free_func(g_free);
+
+    self->task_ssm = fpi_ssm_new(dev, enroll_run_state, ENROLL_NUM_STATES);
+    fpi_ssm_start(self->task_ssm, enroll_ssm_done);
+}
+
+static void dev_verify(FpDevice* dev)
+{
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+
+    clear_pending_result(self);
+    self->action_result_reported = FALSE;
+    self->verify_wait_finger_up = FALSE;
+
+    self->task_ssm = fpi_ssm_new(dev, verify_run_state, VERIFY_NUM_STATES);
+    fpi_ssm_start(self->task_ssm, verify_ssm_done);
+}
+
+static void dev_cancel(FpDevice* dev)
+{
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+
+    if (self->task_ssm)
+        fpi_ssm_mark_failed(self->task_ssm,
+                            g_error_new(G_IO_ERROR, G_IO_ERROR_CANCELLED,
+                                        "Cancelled"));
+}
+
+// ---------------------------------------------------------------------------
+
+static void fpi_device_goodixtls53xd_init(FpiDeviceGoodixTls53XD* self) {}
 
 static void fpi_device_goodixtls53xd_class_init(
-    FpiDeviceGoodixTls53XDClass *class) {
-  FpiDeviceGoodixTlsClass *gx_class = FPI_DEVICE_GOODIXTLS_CLASS(class);
-  FpDeviceClass *dev_class = FP_DEVICE_CLASS(class);
-  FpImageDeviceClass *img_dev_class = FP_IMAGE_DEVICE_CLASS(class);
+    FpiDeviceGoodixTls53XDClass* class)
+{
+    FpiDeviceGoodixTlsClass* gx_class = FPI_DEVICE_GOODIXTLS_CLASS(class);
+    FpDeviceClass* dev_class = FP_DEVICE_CLASS(class);
 
-  gx_class->interface = GOODIX_53XD_INTERFACE;
-  gx_class->ep_in = GOODIX_53XD_EP_IN;
-  gx_class->ep_out = GOODIX_53XD_EP_OUT;
+    gx_class->interface = GOODIX_53XD_INTERFACE;
+    gx_class->ep_in = GOODIX_53XD_EP_IN;
+    gx_class->ep_out = GOODIX_53XD_EP_OUT;
 
-  dev_class->id = "goodixtls53xd";
-  dev_class->full_name = "Goodix TLS Fingerprint Sensor 53XD";
-  dev_class->type = FP_DEVICE_TYPE_USB;
-  dev_class->id_table = id_table;
+    dev_class->id = "goodixtls53xd";
+    dev_class->full_name = "Goodix TLS Fingerprint Sensor 53XD";
+    dev_class->type = FP_DEVICE_TYPE_USB;
+    dev_class->id_table = id_table;
+    dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+    dev_class->nr_enroll_stages = GOODIX53XD_ENROLL_SAMPLES;
+    dev_class->temp_hot_seconds = -1;
 
-  dev_class->scan_type = FP_SCAN_TYPE_PRESS;
+    dev_class->open = dev_open;
+    dev_class->close = dev_close;
+    dev_class->enroll = dev_enroll;
+    dev_class->verify = dev_verify;
+    dev_class->identify = dev_verify;
+    dev_class->cancel = dev_cancel;
 
-  // TODO
-  img_dev_class->bz3_threshold = 24;
-  img_dev_class->img_width = GOODIX53XD_WIDTH;
-  img_dev_class->img_height = GOODIX53XD_HEIGHT;
-
-  img_dev_class->img_open = dev_init;
-  img_dev_class->img_close = dev_deinit;
-  img_dev_class->activate = dev_activate;
-  img_dev_class->change_state = dev_change_state;
-  img_dev_class->deactivate = dev_deactivate;
-
-  fpi_device_class_auto_initialize_features(dev_class);
+    dev_class->features = FP_DEVICE_FEATURE_VERIFY | FP_DEVICE_FEATURE_IDENTIFY;
 }

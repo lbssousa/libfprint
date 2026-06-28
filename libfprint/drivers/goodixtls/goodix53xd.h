@@ -65,8 +65,3 @@ static const FpIdEntry id_table[] = {
     {.vid = 0x27c6, .pid = 0x538d},
     {.vid = 0, .pid = 0, .driver_data = 0},
 };
-
-
-static void write_sensor_complete(FpDevice *dev, gpointer user_data, GError *error) ;
-static void receive_fdt_down_ack(FpDevice* dev, guint8* data, guint16 len,
-                           gpointer ssm, GError* err);

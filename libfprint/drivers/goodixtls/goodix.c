@@ -58,7 +58,7 @@ typedef struct {
 } FpiDeviceGoodixTlsPrivate;
 
 G_DEFINE_ABSTRACT_TYPE_WITH_PRIVATE(FpiDeviceGoodixTls, fpi_device_goodixtls,
-                                    FP_TYPE_IMAGE_DEVICE);
+                                    FP_TYPE_DEVICE);
 
 // TODO remove every GDestroyNotify
 // TODO add cmd timeouts
@@ -1243,10 +1243,6 @@ static void goodix_tls_ready(GoodixTlsServer* server, GError* err, gpointer dev)
     }
     goodix_send_request_tls_connection(FP_DEVICE(dev),
                                        on_goodix_request_tls_connection, dev);
-}
-
-void goodix_tls_complete(FpiSsm *ssm, FpDevice *dev, GError *error) {
-  fpi_image_device_activate_complete(FP_IMAGE_DEVICE(dev), error);
 }
 
 void goodix_tls(FpDevice* dev, GoodixNoneCallback callback, gpointer user_data)
