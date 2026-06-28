@@ -60,7 +60,10 @@
 // expected; they likely need tuning against real 538d captures.
 #define GOODIX53XD_ENROLL_SAMPLES 8
 #define GOODIX53XD_MIN_CAPTURE_KEYPOINTS 8
-#define GOODIX53XD_SIGFM_BEST_MIN 10
+// Minimum SIGFM match score to accept a verify/identify. Calibrated from 538d
+// hardware: impostor fingers scored 0-4, genuine 10-6400+, so 8 sits in the
+// gap with margin on both sides. Tunable.
+#define GOODIX53XD_SIGFM_BEST_MIN 8
 
 // Finger presence is detected from the number of SIFT keypoints SIGFM finds:
 // an empty platen yields ~0, a finger yields many. (The raw dynamic range is
