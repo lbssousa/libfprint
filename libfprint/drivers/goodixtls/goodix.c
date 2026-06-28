@@ -933,7 +933,9 @@ void goodix_send_tls_successfully_established(FpDevice *dev,
 void goodix_send_read_otp(FpDevice* dev, GoodixDefaultCallback callback,
                           gpointer user_data)
 {
-    guint8 payload = {0x40, 0x00};
+    /* NB: originally written as {0x40, 0x00}; payload is a scalar so only
+     * 0x40 was ever sent (sizeof == 1). Behaviour preserved verbatim. */
+    guint8 payload = 0x40;
     GoodixCallbackInfo* cb_info;
 
     if (callback) {

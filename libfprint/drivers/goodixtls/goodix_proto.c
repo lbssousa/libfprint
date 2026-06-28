@@ -89,7 +89,7 @@ gboolean goodix_decode_pack(guint8 *data, guint32 data_len, guint8 *flags,
   if (data_len < length + sizeof(GoodixPack) + sizeof(guint8)) return FALSE;
 
   *flags = pack->flags;
-  *payload = g_memdup(data + sizeof(GoodixPack) + sizeof(guint8), length);
+  *payload = g_memdup2(data + sizeof(GoodixPack) + sizeof(guint8), length);
   *payload_len = length;
   *valid_checksum = goodix_calc_checksum(data, sizeof(GoodixPack)) ==
                     data[sizeof(GoodixPack)];
@@ -111,7 +111,7 @@ gboolean goodix_decode_protocol(guint8 *data, guint32 data_len, guint8 *cmd,
   if (data_len < length + sizeof(GoodixProtocol) + sizeof(guint8)) return FALSE;
 
   *cmd = protocol->cmd;
-  *payload = g_memdup(data + sizeof(GoodixProtocol), length);
+  *payload = g_memdup2(data + sizeof(GoodixProtocol), length);
   *payload_len = length;
   *valid_checksum =
       0xaa - goodix_calc_checksum(data, sizeof(GoodixProtocol) + length) ==
