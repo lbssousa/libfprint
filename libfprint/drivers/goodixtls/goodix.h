@@ -23,12 +23,12 @@
 #define GOODIX_TIMEOUT (1000)
 
 G_DECLARE_DERIVABLE_TYPE(FpiDeviceGoodixTls, fpi_device_goodixtls, FPI,
-                         DEVICE_GOODIXTLS, FpImageDevice)
+                         DEVICE_GOODIXTLS, FpDevice)
 
 #define FPI_TYPE_DEVICE_GOODIXTLS (fpi_device_goodixtls_get_type())
 
 struct _FpiDeviceGoodixTlsClass {
-  FpImageDeviceClass parent;
+  FpDeviceClass parent;
 
   gint interface;
   guint8 ep_in;
@@ -239,8 +239,6 @@ void goodix_read_tls(FpDevice* dev, GoodixTlsCallback callback,
                      gpointer user_data);
 
 void goodix_tls_run_state(FpiSsm* ssm, FpDevice* dev);
-
-void goodix_tls_complete(FpiSsm *ssm, FpDevice *dev, GError *error);
 
 void goodix_tls(FpDevice* dev, GoodixNoneCallback callback, gpointer user_data);
 

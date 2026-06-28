@@ -141,8 +141,6 @@ drivers_info = {
     'upeksonly': {},
     'upekts': {},
     'goodixmoc': {},
-    'goodixtls511': { 'helper': ['goodixtls', 'openssl'], 'endian_dependent': true },
-    'goodixtls52xd': { 'helper': ['goodixtls', 'openssl'], 'endian_dependent': true },
     'goodixtls53xd': { 'helper': ['goodixtls', 'openssl'], 'endian_dependent': true },
     'nb1010': {},
     'fpcmoc': {},

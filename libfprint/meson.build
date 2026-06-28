@@ -134,8 +134,6 @@ driver_sources = {
         'drivers/goodixmoc/goodix.c',
         'drivers/goodixmoc/goodix_proto.c',
     ),
-    'goodixtls511' : files('drivers/goodixtls/goodix511.c'),
-    'goodixtls52xd' : files('drivers/goodixtls/goodix52xd.c'),
     'goodixtls53xd' : files('drivers/goodixtls/goodix53xd.c'),
     'fpcmoc' : files('drivers/fpcmoc/fpc.c'),
     'realtek' : files('drivers/realtek/realtek.c'),
