@@ -152,6 +152,7 @@ helper_sources = {
         'drivers/goodixtls/goodix_proto.c',
         'drivers/goodixtls/goodix.c',
         'drivers/goodixtls/goodixtls.c',
+        'sigfm/sigfm.cpp',
     ),
     'openssl': files(),
     'udev': files(),

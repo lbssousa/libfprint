@@ -291,6 +291,15 @@ foreach i : driver_helpers
         endif
 
         optional_deps += threads_dep
+
+        # SIGFM matcher (OpenCV-based) used by the goodixtls53xd driver for
+        # the tiny press captures where the default minutiae matcher fails.
+        opencv_dep = dependency('opencv4', version: '>= 4.5.0', required: false)
+        if not opencv_dep.found()
+            error('opencv4 (>= 4.5.0) is required for @0@ and possibly others'.format(driver))
+        endif
+
+        optional_deps += opencv_dep
     elif i == 'udev'
         install_udev_rules = true
 
