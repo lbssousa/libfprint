@@ -235,7 +235,7 @@ static guint16 otp_write_addrs[] = {0x0220, 0x0236, 0x0238, 0x023a};
 
 static void otp_write_run(FpiSsm* ssm, FpDevice* dev)
 {
-    guint16 data;
+    guint16 data = 0;
     FpiDeviceGoodixTls511* self = FPI_DEVICE_GOODIXTLS511(dev);
     guint8* otp = self->otp;
     switch (fpi_ssm_get_cur_state(ssm)) {
@@ -411,12 +411,12 @@ static void decode_frame(Goodix511Pix frame[GOODIX511_FRAME_SIZE],
         }
     }
 }
-static int goodix_cmp_short(const void* a, const void* b)
+G_GNUC_UNUSED static int goodix_cmp_short(const void* a, const void* b)
 {
     return (int) (*(short*) a - *(short*) b);
 }
 
-static void rotate_frame(Goodix511Pix frame[GOODIX511_FRAME_SIZE])
+G_GNUC_UNUSED static void rotate_frame(Goodix511Pix frame[GOODIX511_FRAME_SIZE])
 {
     Goodix511Pix buff[GOODIX511_FRAME_SIZE];
 
@@ -442,7 +442,7 @@ static void squash_frame(Goodix511Pix* frame, guint8* squashed)
  * @param frame
  * @param squashed
  */
-static void squash_frame_linear(Goodix511Pix* frame, guint8* squashed)
+G_GNUC_UNUSED static void squash_frame_linear(Goodix511Pix* frame, guint8* squashed)
 {
     Goodix511Pix min = 0xffff;
     Goodix511Pix max = 0;
@@ -480,16 +480,9 @@ static gboolean postprocess_frame(Goodix511Pix frame[GOODIX511_FRAME_SIZE],
     int sum = 0;
     for (int i = 0; i != GOODIX511_FRAME_SIZE; ++i) {
         Goodix511Pix* og_px = frame + i;
-        Goodix511Pix bg_px = // background[i];
-            /*if (bg_px > *og_px) {
-                *og_px = 0;
-            }
-            else {
-                *og_px -= bg_px;
-            }*/
-            //*og_px = MAX(bg_px - *og_px, 0);
-            //* og_px = MAX(*og_px - bg_px, 0);
-            sum += *og_px;
+        /* background subtraction is currently disabled; only the running
+         * sum is computed (used to detect an all-dark frame below). */
+        sum += *og_px;
     }
     if (sum == 0) {
         fp_warn("frame darker than background, finger on scanner during "
@@ -599,7 +592,7 @@ static void scan_empty_run(FpiSsm* ssm, FpDevice* dev)
     }
 }
 
-static void scan_empty_img(FpDevice* dev, FpiSsm* ssm)
+G_GNUC_UNUSED static void scan_empty_img(FpDevice* dev, FpiSsm* ssm)
 {
     fpi_ssm_start_subsm(ssm, fpi_ssm_new(dev, scan_empty_run, SCAN_EMPTY_NUM));
 }

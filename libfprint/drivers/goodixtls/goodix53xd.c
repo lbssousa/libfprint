@@ -206,7 +206,7 @@ static void check_config_upload(FpDevice* dev, gboolean success,
         fpi_ssm_next_state(user_data);
     }
 }
-static void check_powerdown_scan_freq(FpDevice* dev, gboolean success,
+G_GNUC_UNUSED static void check_powerdown_scan_freq(FpDevice* dev, gboolean success,
                                       gpointer user_data, GError* error)
 {
     if (error) {
@@ -227,7 +227,7 @@ enum otp_write_states {
     OTP_WRITE_NUM,
 };
 
-static void otp_write_run(FpiSsm* ssm, FpDevice* dev)
+G_GNUC_UNUSED static void otp_write_run(FpiSsm* ssm, FpDevice* dev)
 {
     /*FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
     switch (fpi_ssm_get_cur_state(ssm)) {
@@ -392,12 +392,12 @@ static void decode_frame(Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE],
         }
     }
 }
-static int goodix_cmp_short(const void* a, const void* b)
+G_GNUC_UNUSED static int goodix_cmp_short(const void* a, const void* b)
 {
     return (int) (*(short*) a - *(short*) b);
 }
 
-static void rotate_frame(Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE])
+G_GNUC_UNUSED static void rotate_frame(Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE])
 {
     Goodix53xdPix buff[GOODIX53XD_FRAME_SIZE];
 
@@ -408,7 +408,7 @@ static void rotate_frame(Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE])
     }
     memcpy(frame, buff, GOODIX53XD_FRAME_SIZE);
 }
-static void squash_frame(Goodix53xdPix* frame, guint8* squashed)
+G_GNUC_UNUSED static void squash_frame(Goodix53xdPix* frame, guint8* squashed)
 {
     for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i) {
         squashed[i] = squash(frame[i]);
@@ -455,7 +455,7 @@ static void squash_frame_linear(Goodix53xdPix* frame, guint8* squashed)
  * @param frame
  * @param background
  */
-static gboolean postprocess_frame(Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE],
+G_GNUC_UNUSED static gboolean postprocess_frame(Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE],
                                   Goodix53xdPix background[GOODIX53XD_FRAME_SIZE])
 {
     int sum = 0;
@@ -585,7 +585,7 @@ static void scan_empty_run(FpiSsm* ssm, FpDevice* dev)
     }
 }
 
-static void scan_empty_img(FpDevice* dev, FpiSsm* ssm)
+G_GNUC_UNUSED static void scan_empty_img(FpDevice* dev, FpiSsm* ssm)
 {
     fpi_ssm_start_subsm(ssm, fpi_ssm_new(dev, scan_empty_run, SCAN_EMPTY_NUM));
 }
@@ -641,7 +641,9 @@ static void scan_run_state(FpiSsm* ssm, FpDevice* dev)
         break;
     case SCAN_STAGE_GET_IMG:
         fpi_image_device_report_finger_status(img_dev, TRUE);
-        guint16 payload = {0x05, 0x03};
+        /* NB: originally written as {0x05, 0x03}; value is a scalar guint16 so
+         * only 0x05 was ever used. Behaviour preserved verbatim. */
+        guint16 payload = 0x05;
         goodix_send_write_sensor_register(dev, 556, payload, write_sensor_complete, ssm);
         break;
     }
