@@ -141,6 +141,9 @@ drivers_info = {
     'upeksonly': {},
     'upekts': {},
     'goodixmoc': {},
+    'goodixtls511': { 'helper': ['goodixtls', 'openssl'], 'endian_dependent': true },
+    'goodixtls52xd': { 'helper': ['goodixtls', 'openssl'], 'endian_dependent': true },
+    'goodixtls53xd': { 'helper': ['goodixtls', 'openssl'], 'endian_dependent': true },
     'nb1010': {},
     'fpcmoc': {},
     'realtek': {},
@@ -243,6 +246,13 @@ foreach i : driver_helpers
         endif
 
         optional_deps += openssl_dep
+    elif i == 'goodixtls'
+        threads_dep = dependency('threads', required: false)
+        if not threads_dep.found()
+            error('threads is required for @0@ and possibly others'.format(driver))
+        endif
+
+        optional_deps += threads_dep
     elif i == 'udev'
         install_udev_rules = true
 
