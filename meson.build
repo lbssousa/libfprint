@@ -142,6 +142,9 @@ default_drivers = [
     'upeksonly',
     'upekts',
     'goodixmoc',
+    'goodixtls511',
+    'goodixtls52xd',
+    'goodixtls53xd',
     'nb1010',
     'fpcmoc',
     'realtek',
@@ -215,6 +218,9 @@ driver_helper_mapping = {
     'aes3500' : [ 'aeslib', 'aes3k' ],
     'aes4000' : [ 'aeslib', 'aes3k' ],
     'uru4000' : [ 'openssl' ],
+    'goodixtls511' : [ 'goodixtls', 'openssl' ],
+    'goodixtls52xd' : [ 'goodixtls', 'openssl' ],
+    'goodixtls53xd' : [ 'goodixtls', 'openssl' ],
     'elanspi' : [ 'udev' ],
     'virtual_image'          : [ 'virtual' ],
     'virtual_device'         : [ 'virtual' ],
@@ -278,6 +284,13 @@ foreach i : driver_helpers
         endif
 
         optional_deps += openssl_dep
+    elif i == 'goodixtls'
+        threads_dep = dependency('threads', required: false)
+        if not threads_dep.found()
+            error('threads is required for @0@ and possibly others'.format(driver))
+        endif
+
+        optional_deps += threads_dep
     elif i == 'udev'
         install_udev_rules = true
 

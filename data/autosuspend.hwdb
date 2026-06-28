@@ -265,6 +265,18 @@ usb:v298Dp1010*
  ID_AUTOSUSPEND=1
  ID_PERSIST=0
 
+# Supported by libfprint driver goodixtls511
+usb:v27C6p5110*
+ ID_AUTOSUSPEND=1
+
+# Supported by libfprint driver goodixtls52xd
+usb:v27C6p521D*
+ ID_AUTOSUSPEND=1
+
+# Supported by libfprint driver goodixtls53xd
+usb:v27C6p538D*
+ ID_AUTOSUSPEND=1
+
 # Supported by libfprint driver realtek
 usb:v0BDAp5813*
 usb:v0BDAp5816*
@@ -477,12 +489,10 @@ usb:v1C7Ap057E*
 usb:v2541p0236*
 usb:v2541p9711*
 usb:v27C6p5042*
-usb:v27C6p5110*
 usb:v27C6p5117*
 usb:v27C6p5120*
 usb:v27C6p5125*
 usb:v27C6p5201*
-usb:v27C6p521D*
 usb:v27C6p5301*
 usb:v27C6p530C*
 usb:v27C6p532D*
@@ -491,7 +501,6 @@ usb:v27C6p533C*
 usb:v27C6p5381*
 usb:v27C6p5385*
 usb:v27C6p538C*
-usb:v27C6p538D*
 usb:v27C6p5395*
 usb:v27C6p5503*
 usb:v27C6p550A*
