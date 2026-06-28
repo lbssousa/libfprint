@@ -61,9 +61,14 @@
 #define GOODIX53XD_ENROLL_SAMPLES 8
 #define GOODIX53XD_MIN_CAPTURE_KEYPOINTS 8
 #define GOODIX53XD_SIGFM_BEST_MIN 10
-// Best-effort delay (ms) used to debounce a press before re-arming finger
-// detection. A proper finger-up FDT event would be better; needs hardware.
-#define GOODIX53XD_FINGER_UP_DELAY_MS 200
+
+// Finger presence is detected from the raw (pre-normalisation) dynamic range
+// of a captured frame: a finger creates ridge/valley capacitance contrast, an
+// empty platen is nearly flat. This threshold is provisional and should be
+// tuned from the "capture raw range" debug values (finger vs no finger).
+#define GOODIX53XD_FINGER_RAW_RANGE 400
+// Delay between finger-detection polls (ms).
+#define GOODIX53XD_FINGER_POLL_MS 80
 
 typedef unsigned short Goodix53xdPix;
 
@@ -74,6 +79,10 @@ struct _FpiDeviceGoodixTls53XD {
 
   // Latest decoded capture as an 8-bit grayscale GOODIX53XD_SENSOR_PIXELS buffer
   guint8* captured_image;
+  // Raw (12-bit) dynamic range of the latest capture, used for finger detection
+  guint last_raw_range;
+  // Target state for the next poll re-jump (used by poll_timeout)
+  gint poll_target_state;
 
   // Enrollment: array of captured 8-bit images (g_free'd)
   GPtrArray* enroll_images;
@@ -429,11 +438,43 @@ static void on_capture_image(FpDevice* dev, guint8* data, guint16 len,
     Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE];
     decode_frame(frame, data);
 
+    // Raw dynamic range (before normalisation) -> finger-presence signal.
+    Goodix53xdPix rmin = 0xffff, rmax = 0;
+    for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i) {
+        if (frame[i] < rmin)
+            rmin = frame[i];
+        if (frame[i] > rmax)
+            rmax = frame[i];
+    }
+    self->last_raw_range = rmax - rmin;
+    fp_dbg("capture: raw range %u (finger threshold %u)",
+           self->last_raw_range, GOODIX53XD_FINGER_RAW_RANGE);
+
     g_clear_pointer(&self->captured_image, g_free);
     self->captured_image = g_malloc(GOODIX53XD_SENSOR_PIXELS);
     squash_frame_linear(frame, self->captured_image);
 
     fpi_ssm_mark_completed(ssm);
+}
+
+static gboolean finger_is_present(FpiDeviceGoodixTls53XD* self)
+{
+    return self->last_raw_range >= GOODIX53XD_FINGER_RAW_RANGE;
+}
+
+// Re-jump the (parent) task SSM to self->poll_target_state after a short delay.
+static void poll_timeout(FpDevice* dev, gpointer ssm)
+{
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+    fpi_ssm_jump_to_state(ssm, self->poll_target_state);
+}
+
+static void poll_again(FpDevice* dev, FpiSsm* ssm, gint target_state)
+{
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+    self->poll_target_state = target_state;
+    fpi_device_add_timeout(dev, GOODIX53XD_FINGER_POLL_MS, poll_timeout, ssm,
+                           NULL);
 }
 
 static void capture_get_img(FpDevice* dev, FpiSsm* ssm)
@@ -524,37 +565,19 @@ static void capture_run_state(FpiSsm* ssm, FpDevice* dev)
 }
 
 // ---------------------------------------------------------------------------
-// Finger-up sub-SSM (best-effort debounce delay)
-// ---------------------------------------------------------------------------
-
-enum finger_up_states {
-    FINGER_UP_WAIT,
-    FINGER_UP_NUM_STATES,
-};
-
-static void finger_up_timeout(FpDevice* dev, gpointer ssm)
-{
-    fpi_ssm_next_state(ssm);
-}
-
-static void finger_up_run_state(FpiSsm* ssm, FpDevice* dev)
-{
-    switch (fpi_ssm_get_cur_state(ssm)) {
-    case FINGER_UP_WAIT:
-        fpi_device_add_timeout(dev, GOODIX53XD_FINGER_UP_DELAY_MS,
-                               finger_up_timeout, ssm, NULL);
-        break;
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Enroll SSM
+//
+// The FDT "down" command does not block until a finger is present on this
+// sensor, so finger presence/absence is detected by polling captured frames
+// and looking at their raw dynamic range (finger_is_present()).
 // ---------------------------------------------------------------------------
 
 enum enroll_states {
     ENROLL_CAPTURE,
+    ENROLL_CAPTURE_CHECK,
     ENROLL_PROCESS,
-    ENROLL_WAIT_FINGER_UP,
+    ENROLL_WAIT_UP,
+    ENROLL_WAIT_UP_CHECK,
     ENROLL_NEXT,
     ENROLL_NUM_STATES,
 };
@@ -564,23 +587,37 @@ static void enroll_run_state(FpiSsm* ssm, FpDevice* dev)
     FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
 
     switch (fpi_ssm_get_cur_state(ssm)) {
-    case ENROLL_CAPTURE: {
+    case ENROLL_CAPTURE:
+    case ENROLL_WAIT_UP: {
         FpiSsm* sub = fpi_ssm_new(dev, capture_run_state, CAPTURE_NUM_STATES);
         fpi_ssm_start_subsm(ssm, sub);
         break;
     }
+
+    case ENROLL_CAPTURE_CHECK:
+        // Poll until a finger is actually on the sensor.
+        if (!finger_is_present(self)) {
+            g_clear_pointer(&self->captured_image, g_free);
+            poll_again(dev, ssm, ENROLL_CAPTURE);
+            return;
+        }
+        fpi_ssm_next_state(ssm);
+        break;
 
     case ENROLL_PROCESS: {
         SigfmImgInfo* info = sigfm_extract(self->captured_image,
                                            GOODIX53XD_WIDTH, GOODIX53XD_HEIGHT);
         int keypoints = sigfm_keypoints_count(info);
         sigfm_free_info(info);
+        fp_dbg("enroll: capture keypoints %d (min %d)", keypoints,
+               GOODIX53XD_MIN_CAPTURE_KEYPOINTS);
 
         if (keypoints < GOODIX53XD_MIN_CAPTURE_KEYPOINTS) {
             g_clear_pointer(&self->captured_image, g_free);
             fpi_device_enroll_progress(
                 dev, self->enroll_stage, NULL,
-                fpi_device_retry_new(FP_DEVICE_RETRY_REMOVE_FINGER));
+                fpi_device_retry_new(FP_DEVICE_RETRY_CENTER_FINGER));
+            // Wait for finger up, then retry this stage.
             fpi_ssm_next_state(ssm);
             return;
         }
@@ -596,12 +633,16 @@ static void enroll_run_state(FpiSsm* ssm, FpDevice* dev)
         break;
     }
 
-    case ENROLL_WAIT_FINGER_UP: {
-        FpiSsm* sub =
-            fpi_ssm_new(dev, finger_up_run_state, FINGER_UP_NUM_STATES);
-        fpi_ssm_start_subsm(ssm, sub);
+    case ENROLL_WAIT_UP_CHECK:
+        // Poll until the finger is lifted before the next sample.
+        if (finger_is_present(self)) {
+            g_clear_pointer(&self->captured_image, g_free);
+            poll_again(dev, ssm, ENROLL_WAIT_UP);
+            return;
+        }
+        g_clear_pointer(&self->captured_image, g_free);
+        fpi_ssm_next_state(ssm);
         break;
-    }
 
     case ENROLL_NEXT:
         if (self->enroll_stage < GOODIX53XD_ENROLL_SAMPLES)
@@ -732,8 +773,10 @@ static int match_against_template(SigfmImgInfo* probe, GVariant* tmpl_data)
 
 enum verify_states {
     VERIFY_CAPTURE,
+    VERIFY_CAPTURE_CHECK,
     VERIFY_MATCH,
-    VERIFY_FINISH,
+    VERIFY_WAIT_UP,
+    VERIFY_WAIT_UP_CHECK,
     VERIFY_NUM_STATES,
 };
 
@@ -748,11 +791,22 @@ static void verify_run_state(FpiSsm* ssm, FpDevice* dev)
         break;
     }
 
+    case VERIFY_CAPTURE_CHECK:
+        if (!finger_is_present(self)) {
+            g_clear_pointer(&self->captured_image, g_free);
+            poll_again(dev, ssm, VERIFY_CAPTURE);
+            return;
+        }
+        fpi_ssm_next_state(ssm);
+        break;
+
     case VERIFY_MATCH: {
         FpiDeviceAction action = fpi_device_get_current_action(dev);
         SigfmImgInfo* probe = sigfm_extract(self->captured_image,
                                             GOODIX53XD_WIDTH, GOODIX53XD_HEIGHT);
         int keypoints = sigfm_keypoints_count(probe);
+        fp_dbg("verify: capture keypoints %d (min %d)", keypoints,
+               GOODIX53XD_MIN_CAPTURE_KEYPOINTS);
 
         if (keypoints < GOODIX53XD_MIN_CAPTURE_KEYPOINTS) {
             if (action == FPI_DEVICE_ACTION_IDENTIFY)
@@ -836,15 +890,28 @@ static void verify_run_state(FpiSsm* ssm, FpDevice* dev)
         break;
     }
 
-    case VERIFY_FINISH:
-        if (self->verify_wait_finger_up) {
+    case VERIFY_WAIT_UP:
+        // On a confirmed match we are done; otherwise wait for finger up
+        // before completing so the user can retry cleanly.
+        if (!self->verify_wait_finger_up) {
+            fpi_ssm_mark_completed(ssm);
+            break;
+        }
+        {
             FpiSsm* sub =
-                fpi_ssm_new(dev, finger_up_run_state, FINGER_UP_NUM_STATES);
+                fpi_ssm_new(dev, capture_run_state, CAPTURE_NUM_STATES);
             fpi_ssm_start_subsm(ssm, sub);
         }
-        else {
-            fpi_ssm_mark_completed(ssm);
+        break;
+
+    case VERIFY_WAIT_UP_CHECK:
+        if (finger_is_present(self)) {
+            g_clear_pointer(&self->captured_image, g_free);
+            poll_again(dev, ssm, VERIFY_WAIT_UP);
+            return;
         }
+        g_clear_pointer(&self->captured_image, g_free);
+        fpi_ssm_mark_completed(ssm);
         break;
     }
 }
