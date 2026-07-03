@@ -86,8 +86,6 @@ struct _FpiDeviceGoodixTls53XD {
   guint last_raw_range;
   // SIGFM keypoint count of the latest capture, used for finger detection
   int last_keypoints;
-  // Target state for the next poll re-jump (used by poll_timeout)
-  gint poll_target_state;
   // Rotating index for GOODIX53XD_DUMP debug PGM files
   guint dump_counter;
 
@@ -490,19 +488,14 @@ static gboolean finger_is_present(FpiDeviceGoodixTls53XD* self)
     return self->last_keypoints >= GOODIX53XD_FINGER_MIN_KEYPOINTS;
 }
 
-// Re-jump the (parent) task SSM to self->poll_target_state after a short delay.
-static void poll_timeout(FpDevice* dev, gpointer ssm)
-{
-    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
-    fpi_ssm_jump_to_state(ssm, self->poll_target_state);
-}
-
+// Re-jump the task SSM to target_state after a short delay.
+// Uses fpi_ssm_jump_to_state_delayed so the pending timeout is stored in
+// ssm->timeout and automatically cancelled if the SSM is freed (e.g. via
+// dev_cancel), preventing the use-after-free crash that occurred when
+// fpi_device_add_timeout was used with a raw ssm pointer and no way to cancel.
 static void poll_again(FpDevice* dev, FpiSsm* ssm, gint target_state)
 {
-    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
-    self->poll_target_state = target_state;
-    fpi_device_add_timeout(dev, GOODIX53XD_FINGER_POLL_MS, poll_timeout, ssm,
-                           NULL);
+    fpi_ssm_jump_to_state_delayed(ssm, target_state, GOODIX53XD_FINGER_POLL_MS);
 }
 
 static void capture_get_img(FpDevice* dev, FpiSsm* ssm)
