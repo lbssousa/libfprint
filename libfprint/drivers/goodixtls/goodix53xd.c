@@ -1021,10 +1021,12 @@ static void dev_cancel(FpDevice* dev)
 {
     FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
 
-    if (self->task_ssm)
+    if (self->task_ssm) {
+        goodix_reset_state(dev);
         fpi_ssm_mark_failed(self->task_ssm,
                             g_error_new(G_IO_ERROR, G_IO_ERROR_CANCELLED,
                                         "Cancelled"));
+    }
 }
 
 // ---------------------------------------------------------------------------
