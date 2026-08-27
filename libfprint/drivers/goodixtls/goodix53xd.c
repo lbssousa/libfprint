@@ -95,6 +95,12 @@ struct _FpiDeviceGoodixTls53XD {
 
   FpiSsm* task_ssm;
 
+  // TRUE while a poll_again() delayed state change is armed on task_ssm
+  // (i.e. between fpi_ssm_jump_to_state_delayed() and the timeout firing).
+  // dev_cancel() needs this to know whether it must disarm the timeout
+  // before calling fpi_ssm_mark_failed(), which asserts none is pending.
+  gboolean poll_timeout_pending;
+
   // Deferred verify/identify result reporting
   gboolean verify_wait_finger_up;
   gboolean pending_result_report;
@@ -495,6 +501,9 @@ static gboolean finger_is_present(FpiDeviceGoodixTls53XD* self)
 // fpi_device_add_timeout was used with a raw ssm pointer and no way to cancel.
 static void poll_again(FpDevice* dev, FpiSsm* ssm, gint target_state)
 {
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+
+    self->poll_timeout_pending = TRUE;
     fpi_ssm_jump_to_state_delayed(ssm, target_state, GOODIX53XD_FINGER_POLL_MS);
 }
 
@@ -606,6 +615,10 @@ enum enroll_states {
 static void enroll_run_state(FpiSsm* ssm, FpDevice* dev)
 {
     FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+
+    // Any state entry means a previously armed poll_again() timeout (if any)
+    // has already fired and cleared itself; keep our bookkeeping in sync.
+    self->poll_timeout_pending = FALSE;
 
     switch (fpi_ssm_get_cur_state(ssm)) {
     case ENROLL_CAPTURE:
@@ -804,6 +817,10 @@ enum verify_states {
 static void verify_run_state(FpiSsm* ssm, FpDevice* dev)
 {
     FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+
+    // Any state entry means a previously armed poll_again() timeout (if any)
+    // has already fired and cleared itself; keep our bookkeeping in sync.
+    self->poll_timeout_pending = FALSE;
 
     switch (fpi_ssm_get_cur_state(ssm)) {
     case VERIFY_CAPTURE: {
@@ -1022,6 +1039,15 @@ static void dev_cancel(FpDevice* dev)
     FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
 
     if (self->task_ssm) {
+        // A poll_again() delayed state change may still be armed on
+        // task_ssm (we're waiting out GOODIX53XD_FINGER_POLL_MS between
+        // finger-presence polls). fpi_ssm_mark_failed() asserts no timeout
+        // is pending, so disarm it first or we hit
+        // "BUG: (machine->timeout != NULL)" and leave the timeout dangling.
+        if (self->poll_timeout_pending) {
+            fpi_ssm_cancel_delayed_state_change(self->task_ssm);
+            self->poll_timeout_pending = FALSE;
+        }
         goodix_reset_state(dev);
         fpi_ssm_mark_failed(self->task_ssm,
                             g_error_new(G_IO_ERROR, G_IO_ERROR_CANCELLED,
