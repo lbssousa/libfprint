@@ -1049,6 +1049,22 @@ static void dev_cancel(FpDevice* dev)
             self->poll_timeout_pending = FALSE;
         }
         goodix_reset_state(dev);
+
+        // A FDT_DOWN "wait for finger" (0x32) may still be outstanding on
+        // the MCU itself when we get here: goodix_reset_state() only clears
+        // our own ack/reply/timeout bookkeeping, it can't un-send bytes
+        // already on the wire. Left alone, the MCU eventually replies to
+        // that stale FDT_DOWN once a *new* command is already in flight, and
+        // its cmd byte (0x32) no longer matches priv->cmd -> permanent
+        // "Invalid protocol/ACK command" desync for the rest of this
+        // fprintd process's life (confirmed in the field: only a full
+        // fprintd restart recovers). Explicitly switching the MCU to idle
+        // closes out any pending FDT sequence on its side before the next
+        // verify attempt starts. Fire-and-forget: priv state is already
+        // clear so it can't collide with the next command, and it
+        // self-resolves via ack-or-GOODIX_TIMEOUT either way.
+        goodix_send_mcu_switch_to_idle_mode(dev, 20, NULL, NULL);
+
         fpi_ssm_mark_failed(self->task_ssm,
                             g_error_new(G_IO_ERROR, G_IO_ERROR_CANCELLED,
                                         "Cancelled"));
