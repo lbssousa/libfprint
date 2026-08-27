@@ -290,9 +290,15 @@ foreach i : driver_helpers
 
         # SIGFM matcher (OpenCV-based) used by the goodixtls53xd driver for
         # the tiny press captures where the default minutiae matcher fails.
+        # OpenCV's pkg-config file is named after its major version
+        # (opencv4.pc, opencv5.pc, ...); the API SIGFM uses hasn't changed
+        # across that boundary, so accept whichever is installed.
         opencv_dep = dependency('opencv4', version: '>= 4.5.0', required: false)
         if not opencv_dep.found()
-            error('opencv4 (>= 4.5.0) is required for @0@ and possibly others'.format(driver))
+            opencv_dep = dependency('opencv5', version: '>= 5.0.0', required: false)
+        endif
+        if not opencv_dep.found()
+            error('opencv4 (>= 4.5.0) or opencv5 is required for @0@ and possibly others'.format(driver))
         endif
 
         optional_deps += opencv_dep
