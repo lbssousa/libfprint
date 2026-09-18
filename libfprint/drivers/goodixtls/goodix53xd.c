@@ -780,11 +780,24 @@ static void flush_pending_result(FpDevice* dev)
     self->pending_verify_result = 0;
 }
 
-// Match the probe against one stored template ("aay" of raw images), returning
-// the best per-sample SIGFM score.
+// Match the probe against one stored template ("aay" of raw images).
+//
+// Returns the *second*-highest per-sample SIGFM score across the template's
+// GOODIX53XD_ENROLL_SAMPLES stored samples, not the single best one. Taking
+// the max of many independent pairwise comparisons (8 samples per enrolled
+// finger, times the gallery size on identify) inflates the false-accept
+// rate well beyond what a single-pair threshold calibration suggests: a
+// lone coincidentally-high score against one stored sample is enough to
+// accept with max-pooling, and on this small 64x80 sensor with few SIFT
+// keypoints such one-off collisions are common enough to cause cross-finger
+// false accepts (e.g. left index confused for an already-enrolled right
+// index). Requiring two independent stored samples to each clear the
+// threshold keeps genuine matches (which score highly consistently) intact
+// while making a single spurious high score insufficient.
 static int match_against_template(SigfmImgInfo* probe, GVariant* tmpl_data)
 {
     int best = 0;
+    int second_best = 0;
     GVariantIter iter;
     GVariant* child;
 
@@ -797,12 +810,17 @@ static int match_against_template(SigfmImgInfo* probe, GVariant* tmpl_data)
                 sigfm_extract(img, GOODIX53XD_WIDTH, GOODIX53XD_HEIGHT);
             int score = sigfm_match_score(probe, tmpl_info);
             sigfm_free_info(tmpl_info);
-            if (score > best)
+            if (score > best) {
+                second_best = best;
                 best = score;
+            }
+            else if (score > second_best) {
+                second_best = score;
+            }
         }
         g_variant_unref(child);
     }
-    return best;
+    return second_best;
 }
 
 enum verify_states {
@@ -878,7 +896,7 @@ static void verify_run_state(FpiSsm* ssm, FpDevice* dev)
                     continue;
                 int score = match_against_template(probe, tmpl_data);
                 g_variant_unref(tmpl_data);
-                fp_dbg("identify: gallery[%u] sigfm best %d", i, score);
+                fp_dbg("identify: gallery[%u] sigfm corroborated %d", i, score);
                 if (score >= GOODIX53XD_SIGFM_BEST_MIN && score > best_score) {
                     best_score = score;
                     match = tmpl;
@@ -905,7 +923,7 @@ static void verify_run_state(FpiSsm* ssm, FpDevice* dev)
                 best_score = match_against_template(probe, data);
                 g_variant_unref(data);
             }
-            fp_dbg("verify: best sigfm %d (min %d)", best_score,
+            fp_dbg("verify: corroborated sigfm %d (min %d)", best_score,
                    GOODIX53XD_SIGFM_BEST_MIN);
 
             if (best_score >= GOODIX53XD_SIGFM_BEST_MIN) {
