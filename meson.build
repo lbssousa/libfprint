@@ -298,7 +298,70 @@ foreach i : driver_helpers
             opencv_dep = dependency('opencv5', version: '>= 5.0.0', required: false)
         endif
         if not opencv_dep.found()
-            error('opencv4 (>= 4.5.0) or opencv5 is required for @0@ and possibly others'.format(driver))
+            # No system OpenCV: build the small subset SIGFM actually needs
+            # (core, imgproc, flann, geometry, features) from vendored
+            # source (subprojects/opencv.wrap) as a static library, so the
+            # driver doesn't require opencv-devel/opencv5-devel to be
+            # installed. See subprojects/opencv.wrap for version/hash, and
+            # the cmake_opts below for why CPU dispatch is disabled.
+            cmake = import('cmake')
+            opencv_cmake_opts = cmake.subproject_options()
+            opencv_cmake_opts.add_cmake_defines({
+                'BUILD_LIST': 'core,flann,geometry,imgproc,features',
+                'BUILD_SHARED_LIBS': false,
+                'BUILD_TESTS': false,
+                'BUILD_PERF_TESTS': false,
+                'BUILD_EXAMPLES': false,
+                'BUILD_DOCS': false,
+                'BUILD_opencv_apps': false,
+                'BUILD_JAVA': false,
+                'BUILD_opencv_python2': false,
+                'BUILD_opencv_python3': false,
+                'BUILD_opencv_js': false,
+                'BUILD_opencv_objc': false,
+                'WITH_1394': false,
+                'WITH_FFMPEG': false,
+                'WITH_GSTREAMER': false,
+                'WITH_GTK': false,
+                'WITH_QT': false,
+                'WITH_V4L': false,
+                'WITH_OPENCL': false,
+                'WITH_CUDA': false,
+                'WITH_VTK': false,
+                'WITH_OPENEXR': false,
+                'WITH_JPEG': false,
+                'WITH_PNG': false,
+                'WITH_TIFF': false,
+                'WITH_WEBP': false,
+                'WITH_OPENJPEG': false,
+                'WITH_JASPER': false,
+                'WITH_IPP': false,
+                'WITH_ITT': false,
+                'WITH_LAPACK': false,
+                'WITH_EIGEN': false,
+                'WITH_PROTOBUF': false,
+                'WITH_QUIRC': false,
+                # Meson's CMake-subproject translator can't replicate
+                # OpenCV's per-file multi-variant CPU dispatch (the same
+                # .dispatch.cpp compiled several times with different SIMD
+                # flags), which fails the build. A single baseline build is
+                # plenty for the small fingerprint captures SIGFM matches.
+                'CPU_BASELINE': '',
+                'CPU_DISPATCH': '',
+                'CV_DISABLE_OPTIMIZATION': true,
+                'CMAKE_POSITION_INDEPENDENT_CODE': true,
+            })
+            opencv_cmake_opts.set_install(false)
+            opencv_cmake_sub = cmake.subproject('opencv', options: opencv_cmake_opts)
+            opencv_dep = declare_dependency(
+                dependencies: [
+                    opencv_cmake_sub.dependency('opencv_core'),
+                    opencv_cmake_sub.dependency('opencv_imgproc'),
+                    opencv_cmake_sub.dependency('opencv_flann'),
+                    opencv_cmake_sub.dependency('opencv_geometry'),
+                    opencv_cmake_sub.dependency('opencv_features'),
+                ],
+            )
         endif
 
         optional_deps += opencv_dep

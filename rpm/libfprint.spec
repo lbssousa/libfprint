@@ -14,6 +14,12 @@
 %global goodix_tag v1.94.10-goodix538d
 %global goodix_dir %{name}-1.94.10-goodix538d
 
+# OpenCV source tarball for the vendored SIGFM matcher build (see
+# subprojects/opencv.wrap). Mock/koji builds have no network access during
+# %%build, so it's fetched as an RPM Source and pre-seeded into Meson's
+# wrap package cache in %%prep instead of letting Meson download it.
+%global opencv_ver 5.0.0
+
 Name:           libfprint
 Version:        1.94.10
 Release:        100.goodix538d%{?dist}
@@ -21,16 +27,18 @@ Summary:        Toolkit for fingerprint scanner (with Goodix 538d support)
 
 # Most of the code is LGPL-2.1-or-later; libfprint/nbis is NIST-PD.
 # The vendored SIGFM matcher (libfprint/sigfm) is LGPL-2.1-or-later.
-License:        LGPL-2.1-or-later AND NIST-PD
+# subprojects/opencv.wrap fetches Apache-2.0 licensed OpenCV source and
+# statically links a small subset of it into the goodixtls53xd driver.
+License:        LGPL-2.1-or-later AND NIST-PD AND Apache-2.0
 URL:            https://github.com/lbssousa/libfprint
 Source0:        %{url}/archive/refs/tags/%{goodix_tag}.tar.gz#/%{name}-%{goodix_tag}.tar.gz
+Source1:        https://github.com/opencv/opencv/archive/refs/tags/%{opencv_ver}.tar.gz#/opencv-%{opencv_ver}.tar.gz
 
 BuildRequires:  meson
+BuildRequires:  cmake
 BuildRequires:  gcc
 BuildRequires:  gcc-c++
 BuildRequires:  openssl-devel
-# Goodix 538d SIGFM matcher
-BuildRequires:  pkgconfig(opencv4) >= 4.5.0
 BuildRequires:  pkgconfig(glib-2.0) >= 2.50
 BuildRequires:  pkgconfig(gio-2.0) >= 2.44.0
 BuildRequires:  pkgconfig(gusb) >= 0.3.0
@@ -44,9 +52,6 @@ BuildRequires:  gobject-introspection-devel
 # For internal CI tests; umockdev 0.13.2 has an important locking fix
 BuildRequires:  python3-cairo python3-gobject cairo-devel
 BuildRequires:  umockdev >= 0.13.2
-
-# Runtime dependency of the SIGFM matcher in the goodixtls53xd driver
-Requires:       opencv
 
 %description
 libfprint offers support for consumer fingerprint reader devices.
@@ -73,10 +78,16 @@ the functionality of the installed %{name} package.
 %prep
 %autosetup -n %{goodix_dir}
 
+# Pre-seed Meson's wrap package cache with the OpenCV source so the
+# subprojects/opencv.wrap fallback (used when opencv-devel isn't installed)
+# doesn't need network access during %%build.
+mkdir -p subprojects/packagecache
+cp %{SOURCE1} subprojects/packagecache/
+
 %build
 # "all" includes the default drivers (with goodixtls53xd) plus the virtual
 # drivers used by the integration tests.
-%meson -Ddrivers=all
+%meson -Ddrivers=all --wrap-mode=nodownload
 %meson_build
 
 %install
@@ -109,6 +120,12 @@ the functionality of the installed %{name} package.
 %{_datadir}/installed-tests/libfprint-2/
 
 %changelog
+* Tue Sep 22 2026 Laercio de Sousa <laercio@sivali.sousa.nom.br> - 1.94.10-100.goodix538d
+- Vendor OpenCV (subprojects/opencv.wrap) instead of requiring opencv-devel:
+  drop the opencv4 BuildRequires and the opencv runtime Requires, add cmake
+  BuildRequires, and pre-seed the OpenCV source (new Source1) into Meson's
+  wrap cache so %%build stays network-free.
+
 * Sun Jun 28 2026 Laercio de Sousa <laercio@sivali.sousa.nom.br> - 1.94.10-100.goodix538d
 - Fork of Fedora's libfprint 1.94.10 adding the goodixtls53xd driver
   (Goodix 27c6:538d): real TLS-PSK capture backend + SIGFM/OpenCV matching.

@@ -23,20 +23,18 @@
 #include "binary.hpp"
 #include "img-info.hpp"
 
-#include "opencv2/core/persistence.hpp"
 #include "opencv2/core/types.hpp"
 #include "opencv2/features2d.hpp"
-#include "opencv2/imgcodecs.hpp"
+#include "opencv2/imgproc.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <set>
 #include <sstream>
 #include <string>
 #include <tuple>
-
-#include <opencv2/opencv.hpp>
 #include <vector>
 
 namespace bin {

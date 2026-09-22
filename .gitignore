@@ -1,3 +1,7 @@
 *.o
 *.swp
 _build
+
+# Meson wrap subprojects: keep the .wrap files, ignore what they fetch/extract.
+/subprojects/*/
+/subprojects/packagecache/
