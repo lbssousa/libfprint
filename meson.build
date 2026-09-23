@@ -437,11 +437,20 @@ echo "$5  $2" | "$6" -c -
 
             # CMake's GNUInstallDirs names the include subdir after the
             # major version (opencv4/ for 4.x, opencv5/ for 5.x, ...).
+            #
+            # include_directories() can't be used here: it unconditionally
+            # rejects any absolute path argument ("Tried to form an
+            # absolute path to a dir in the source tree"), and
+            # opencv_install_dir is necessarily absolute (it's under
+            # meson.project_build_root(), only known at configure time).
+            # -isystem via compile_args is the standard workaround, and
+            # keeps the same "system header" treatment (silences warnings
+            # from OpenCV's own headers) that is_system: true gave us.
             opencv_major = opencv_version.split('.')[0]
             opencv_dep = declare_dependency(
                 link_args: opencv_link_args,
                 dependencies: [zlib_dep],
-                include_directories: include_directories(opencv_install_dir / 'include' / ('opencv' + opencv_major), is_system: true),
+                compile_args: ['-isystem' + (opencv_install_dir / 'include' / ('opencv' + opencv_major))],
             )
         endif
 
