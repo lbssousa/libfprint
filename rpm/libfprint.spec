@@ -11,12 +11,12 @@
 
 # GitHub release tag and the directory name inside its archive (GitHub strips
 # the leading "v" from vX.Y.Z-style tags).
-%global goodix_tag v1.94.10-goodix538d
-%global goodix_dir %{name}-1.94.10-goodix538d
+%global goodix_tag v1.94.10-goodix538d.2
+%global goodix_dir %{name}-1.94.10-goodix538d.2
 
 Name:           libfprint
 Version:        1.94.10
-Release:        100.goodix538d%{?dist}
+Release:        101.goodix538d%{?dist}
 Summary:        Toolkit for fingerprint scanner (with Goodix 538d support)
 
 # Most of the code is LGPL-2.1-or-later; libfprint/nbis is NIST-PD.
@@ -104,6 +104,14 @@ the functionality of the installed %{name} package.
 %{_datadir}/installed-tests/libfprint-2/
 
 %changelog
+* Fri Sep 25 2026 Laercio de Sousa <laercio@sivali.sousa.nom.br> - 1.94.10-101.goodix538d
+- goodixtls53xd: replace the OpenCV-based SIGFM matcher with a self-contained
+  C implementation; drop the vendored OpenCV (Source1, cmake BuildRequires)
+  and its Apache-2.0 license tag.
+- goodixtls53xd: remove the sensor's fixed pattern before matching, learned
+  from enrollment sessions and kept in fprintd's state directory. Prints from
+  earlier versions must be re-enrolled.
+
 * Tue Sep 22 2026 Laercio de Sousa <laercio@sivali.sousa.nom.br> - 1.94.10-100.goodix538d
 - Vendor OpenCV (subprojects/opencv.wrap) instead of requiring opencv-devel:
   drop the opencv4 BuildRequires and the opencv runtime Requires, add cmake
