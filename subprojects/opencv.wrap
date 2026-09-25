@@ -1,5 +1,0 @@
-[wrap-file]
-directory = opencv-5.0.0
-source_url = https://github.com/opencv/opencv/archive/refs/tags/5.0.0.tar.gz
-source_filename = opencv-5.0.0.tar.gz
-source_hash = b0528f5a1d379d59d4701cb28c36e22214cc51cf64594e5b56f2d3e6c0233095
