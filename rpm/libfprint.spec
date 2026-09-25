@@ -2,7 +2,7 @@
 ##
 ## Drop-in replacement for Fedora's libfprint that adds the goodixtls53xd
 ## driver (Goodix 27c6:538d) using a real TLS-PSK capture backend and the
-## SIGFM (SIFT/OpenCV) matcher. Based on upstream libfprint 1.94.10 plus the
+## SIGFM (SIFT) matcher. Based on upstream libfprint 1.94.10 plus the
 ## work in https://github.com/lbssousa/libfprint (tag below).
 ##
 ## The Release is deliberately high so this supersedes Fedora's stock
@@ -14,12 +14,6 @@
 %global goodix_tag v1.94.10-goodix538d
 %global goodix_dir %{name}-1.94.10-goodix538d
 
-# OpenCV source tarball for the vendored SIGFM matcher build (see
-# subprojects/opencv.wrap). Mock/koji builds have no network access during
-# %%build, so it's fetched as an RPM Source and pre-seeded into Meson's
-# wrap package cache in %%prep instead of letting Meson download it.
-%global opencv_ver 5.0.0
-
 Name:           libfprint
 Version:        1.94.10
 Release:        100.goodix538d%{?dist}
@@ -27,15 +21,11 @@ Summary:        Toolkit for fingerprint scanner (with Goodix 538d support)
 
 # Most of the code is LGPL-2.1-or-later; libfprint/nbis is NIST-PD.
 # The vendored SIGFM matcher (libfprint/sigfm) is LGPL-2.1-or-later.
-# subprojects/opencv.wrap fetches Apache-2.0 licensed OpenCV source and
-# statically links a small subset of it into the goodixtls53xd driver.
-License:        LGPL-2.1-or-later AND NIST-PD AND Apache-2.0
+License:        LGPL-2.1-or-later AND NIST-PD
 URL:            https://github.com/lbssousa/libfprint
 Source0:        %{url}/archive/refs/tags/%{goodix_tag}.tar.gz#/%{name}-%{goodix_tag}.tar.gz
-Source1:        https://github.com/opencv/opencv/archive/refs/tags/%{opencv_ver}.tar.gz#/opencv-%{opencv_ver}.tar.gz
 
 BuildRequires:  meson
-BuildRequires:  cmake
 BuildRequires:  gcc
 BuildRequires:  gcc-c++
 BuildRequires:  openssl-devel
@@ -57,7 +47,7 @@ BuildRequires:  umockdev >= 0.13.2
 libfprint offers support for consumer fingerprint reader devices.
 
 This build adds the goodixtls53xd driver for the Goodix 27c6:538d sensor
-(real TLS-PSK capture + SIGFM/OpenCV matching) on top of upstream 1.94.10.
+(real TLS-PSK capture + SIGFM matching) on top of upstream 1.94.10.
 
 %package        devel
 Summary:        Development files for %{name}
@@ -77,12 +67,6 @@ the functionality of the installed %{name} package.
 
 %prep
 %autosetup -n %{goodix_dir}
-
-# Pre-seed Meson's wrap package cache with the OpenCV source so the
-# subprojects/opencv.wrap fallback (used when opencv-devel isn't installed)
-# doesn't need network access during %%build.
-mkdir -p subprojects/packagecache
-cp %{SOURCE1} subprojects/packagecache/
 
 %build
 # "all" includes the default drivers (with goodixtls53xd) plus the virtual

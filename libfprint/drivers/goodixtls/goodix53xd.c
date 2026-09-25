@@ -43,7 +43,7 @@
 #include "goodix.h"
 #include "goodix_proto.h"
 #include "goodix53xd.h"
-#include "sigfm/sigfm.hpp"
+#include "sigfm/sigfm.h"
 
 #define GOODIX53XD_WIDTH 64
 #define GOODIX53XD_HEIGHT 80
