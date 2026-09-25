@@ -43,27 +43,27 @@
 #include "goodix.h"
 #include "goodix_proto.h"
 #include "goodix53xd.h"
-#include "sigfm/sigfm.h"
+#include "goodix53xd_match.h"
 
-#define GOODIX53XD_WIDTH 64
-#define GOODIX53XD_HEIGHT 80
 #define GOODIX53XD_SCAN_WIDTH 64
-#define GOODIX53XD_FRAME_SIZE (GOODIX53XD_WIDTH * GOODIX53XD_HEIGHT)
 // For every 4 pixels there are 6 bytes
 #define GOODIX53XD_RAW_FRAME_SIZE                                               \
     (GOODIX53XD_HEIGHT * GOODIX53XD_SCAN_WIDTH) / 4 * 6
 
 #define GOODIX53XD_SENSOR_PIXELS GOODIX53XD_FRAME_SIZE
 
-// Matching / enrollment tuning. These start from the AndyHazz 53x5 values but
-// the 538d sensor is smaller (64x80 vs 108x88), so fewer SIFT keypoints are
-// expected; they likely need tuning against real 538d captures.
-#define GOODIX53XD_ENROLL_SAMPLES 8
+// Matching / enrollment tuning. On a 64x80 sensor each press covers a small
+// part of the finger; offline evaluation (sigfm-eval) cut genuine rejections
+// from 27% to 8% going from 8 to 16 enrollment samples.
+#define GOODIX53XD_ENROLL_SAMPLES 16
 #define GOODIX53XD_MIN_CAPTURE_KEYPOINTS 8
-// Minimum SIGFM match score to accept a verify/identify. Calibrated from 538d
-// hardware: impostor fingers scored 0-4, genuine 10-6400+, so 8 sits in the
-// gap with margin on both sides. Tunable.
-#define GOODIX53XD_SIGFM_BEST_MIN 8
+// An enrollment sample scoring at least this against an earlier sample of
+// the same enrollment was pressed on (nearly) the same spot, and adds little
+// coverage: ask for another press. Offline, repeated presses scored in the
+// thousands up to ~85000, while probes from other sessions had a median of
+// ~960; 5000 would have re-asked ~15% of the samples. Only applied with a
+// calibration from earlier enrollments, uncalibrated scores are erratic.
+#define GOODIX53XD_ENROLL_DUPLICATE_SCORE 5000
 
 // Finger presence is detected from the number of SIFT keypoints SIGFM finds:
 // an empty platen yields ~0, a finger yields many. (The raw dynamic range is
@@ -72,8 +72,16 @@
 #define GOODIX53XD_FINGER_MIN_KEYPOINTS 5
 // Delay between finger-detection polls (ms).
 #define GOODIX53XD_FINGER_POLL_MS 80
+// Print data format: (version, calibration session id, raw 12-bit frames).
+// Version 1 prints (plain "aay" of 8-bit images without fixed-pattern
+// removal) are rejected and must be re-enrolled.
+#define GOODIX53XD_PRINT_VERSION 2
+#define GOODIX53XD_PRINT_TYPE "(ytaaq)"
+#define GOODIX53XD_CALIB_FILE "goodixtls53xd-fpn.bin"
 
-typedef unsigned short Goodix53xdPix;
+// Cap on empty-platen frames saved per device open by GOODIX53XD_DUMP (the
+// finger poll produces one every GOODIX53XD_FINGER_POLL_MS).
+#define GOODIX53XD_DUMP_MAX_EMPTY 16
 
 struct _FpiDeviceGoodixTls53XD {
   FpiDeviceGoodixTls parent;
@@ -82,15 +90,26 @@ struct _FpiDeviceGoodixTls53XD {
 
   // Latest decoded capture as an 8-bit grayscale GOODIX53XD_SENSOR_PIXELS buffer
   guint8* captured_image;
+  // Latest capture as decoded 12-bit pixels, before any normalisation
+  Goodix53xdPix captured_raw[GOODIX53XD_FRAME_SIZE];
   // Raw (12-bit) dynamic range of the latest capture (informational)
   guint last_raw_range;
   // SIGFM keypoint count of the latest capture, used for finger detection
   int last_keypoints;
   // Rotating index for GOODIX53XD_DUMP debug PGM files
   guint dump_counter;
+  // Empty-platen frames saved by GOODIX53XD_DUMP since the device was opened
+  guint dump_empty_count;
 
-  // Enrollment: array of captured 8-bit images (g_free'd)
+  // Enrollment: array of captured raw 12-bit frames (g_free'd)
   GPtrArray* enroll_images;
+  // Fixed pattern from earlier enrollments for duplicate detection, or NULL
+  // if there were none yet
+  float* enroll_fpn;
+
+  // Fixed-pattern calibration (GArray of Goodix53xdCalibSession), persisted
+  // at calib_path()
+  GArray* calib;
   guint enroll_stage;
 
   FpiSsm* task_ssm;
@@ -116,6 +135,31 @@ G_DECLARE_FINAL_TYPE(FpiDeviceGoodixTls53XD, fpi_device_goodixtls53xd, FPI,
 
 G_DEFINE_TYPE(FpiDeviceGoodixTls53XD, fpi_device_goodixtls53xd,
               FPI_TYPE_DEVICE_GOODIXTLS);
+
+// The calibration lives in fprintd's state directory (systemd sets
+// STATE_DIRECTORY for its StateDirectory=fprint); outside of fprintd, e.g.
+// with the examples, in the user's data directory.
+static char* calib_path(void)
+{
+    const char* state = g_getenv("STATE_DIRECTORY");
+
+    if (state && *state) {
+        g_auto(GStrv) dirs = g_strsplit(state, ":", 2);
+        return g_build_filename(dirs[0], GOODIX53XD_CALIB_FILE, NULL);
+    }
+    return g_build_filename(g_get_user_data_dir(), "libfprint",
+                            GOODIX53XD_CALIB_FILE, NULL);
+}
+
+static gboolean print_data_is_current(GVariant* data)
+{
+    guint8 version;
+
+    if (!g_variant_is_of_type(data, G_VARIANT_TYPE(GOODIX53XD_PRINT_TYPE)))
+        return FALSE;
+    g_variant_get_child(data, 0, "y", &version);
+    return version == GOODIX53XD_PRINT_VERSION;
+}
 
 // ---------------------------------------------------------------------------
 // Generic SSM callbacks shared by activation and capture
@@ -387,30 +431,6 @@ static void decode_frame(Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE],
     }
 }
 
-// Borrowed from the elan driver: stretch the 12-bit pixels into the 8-bit
-// range based on the per-frame min/max.
-static void squash_frame_linear(Goodix53xdPix* frame, guint8* squashed)
-{
-    Goodix53xdPix min = 0xffff;
-    Goodix53xdPix max = 0;
-
-    for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i) {
-        const Goodix53xdPix pix = frame[i];
-        if (pix < min)
-            min = pix;
-        if (pix > max)
-            max = pix;
-    }
-
-    for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i) {
-        const Goodix53xdPix pix = frame[i];
-        if (pix - min == 0 || max - min == 0)
-            squashed[i] = 0;
-        else
-            squashed[i] = (pix - min) * 0xff / (max - min);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Capture sub-SSM: wait for finger (FDT down) + read one image
 // ---------------------------------------------------------------------------
@@ -431,6 +451,54 @@ enum capture_states {
 
 static void capture_fdt_down_arm(FpDevice* dev, FpiSsm* ssm);
 
+static void write_pgm(const char* path, const guint8* img)
+{
+    FILE* f = fopen(path, "wb");
+    if (f) {
+        fprintf(f, "P5\n%d %d\n255\n", GOODIX53XD_WIDTH, GOODIX53XD_HEIGHT);
+        fwrite(img, 1, GOODIX53XD_SENSOR_PIXELS, f);
+        fclose(f);
+    }
+}
+
+// Save the latest capture as a dataset sample for offline evaluation
+// (libfprint/sigfm/sigfm-eval.c) when GOODIX53XD_DUMP=/path/prefix is set.
+// Unlike the rotating debug PGMs these are never overwritten:
+// <prefix>-<kind>-<usec>.raw16 holds the decoded 12-bit frame (little-endian
+// guint16, row-major) and <prefix>-<kind>-<usec>.pgm the 8-bit image the
+// matcher saw.
+static void dump_sample(FpiDeviceGoodixTls53XD* self, const char* kind)
+{
+    const char* dump = g_getenv("GOODIX53XD_DUMP");
+    if (!dump || !self->captured_image)
+        return;
+
+    g_autofree char* base = g_strdup_printf("%s-%s-%" G_GINT64_FORMAT, dump,
+                                            kind, g_get_real_time());
+    g_autofree char* raw_path = g_strconcat(base, ".raw16", NULL);
+    g_autofree char* pgm_path = g_strconcat(base, ".pgm", NULL);
+    guint16 raw_le[GOODIX53XD_FRAME_SIZE];
+    g_autoptr(GError) error = NULL;
+
+    for (int i = 0; i != GOODIX53XD_FRAME_SIZE; ++i)
+        raw_le[i] = GUINT16_TO_LE(self->captured_raw[i]);
+    if (!g_file_set_contents(raw_path, (const char*) raw_le, sizeof(raw_le),
+                             &error))
+        fp_warn("failed to dump sample: %s", error->message);
+    write_pgm(pgm_path, self->captured_image);
+}
+
+// Empty-platen frames are needed offline to estimate the sensor background;
+// save only the first few of each session since the finger poll never stops.
+static void dump_empty_sample(FpiDeviceGoodixTls53XD* self)
+{
+    if (self->dump_empty_count >= GOODIX53XD_DUMP_MAX_EMPTY ||
+        !g_getenv("GOODIX53XD_DUMP"))
+        return;
+    self->dump_empty_count++;
+    dump_sample(self, "empty");
+}
+
 static void on_capture_image(FpDevice* dev, guint8* data, guint16 len,
                              gpointer ssm, GError* err)
 {
@@ -446,7 +514,7 @@ static void on_capture_image(FpDevice* dev, guint8* data, guint16 len,
     }
 
     FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
-    Goodix53xdPix frame[GOODIX53XD_FRAME_SIZE];
+    Goodix53xdPix* frame = self->captured_raw;
     decode_frame(frame, data);
 
     // Raw dynamic range (before normalisation) -> finger-presence signal.
@@ -461,7 +529,7 @@ static void on_capture_image(FpDevice* dev, guint8* data, guint16 len,
 
     g_clear_pointer(&self->captured_image, g_free);
     self->captured_image = g_malloc(GOODIX53XD_SENSOR_PIXELS);
-    squash_frame_linear(frame, self->captured_image);
+    goodix53xd_squash_frame_linear(frame, self->captured_image);
 
     // Keypoint count is our finger-presence / quality signal.
     SigfmImgInfo* info = sigfm_extract(self->captured_image, GOODIX53XD_WIDTH,
@@ -478,12 +546,7 @@ static void on_capture_image(FpDevice* dev, guint8* data, guint16 len,
     if (dump) {
         g_autofree char* path =
             g_strdup_printf("%s-%03d.pgm", dump, self->dump_counter++ % 20);
-        FILE* f = fopen(path, "wb");
-        if (f) {
-            fprintf(f, "P5\n%d %d\n255\n", GOODIX53XD_WIDTH, GOODIX53XD_HEIGHT);
-            fwrite(self->captured_image, 1, GOODIX53XD_SENSOR_PIXELS, f);
-            fclose(f);
-        }
+        write_pgm(path, self->captured_image);
     }
 
     fpi_ssm_mark_completed(ssm);
@@ -631,6 +694,7 @@ static void enroll_run_state(FpiSsm* ssm, FpDevice* dev)
     case ENROLL_CAPTURE_CHECK:
         // Poll until a finger is actually on the sensor.
         if (!finger_is_present(self)) {
+            dump_empty_sample(self);
             g_clear_pointer(&self->captured_image, g_free);
             poll_again(dev, ssm, ENROLL_CAPTURE);
             return;
@@ -656,8 +720,29 @@ static void enroll_run_state(FpiSsm* ssm, FpDevice* dev)
             return;
         }
 
-        g_ptr_array_add(self->enroll_images, self->captured_image);
-        self->captured_image = NULL;
+        if (self->enroll_fpn && self->enroll_images->len > 0) {
+            int dup = goodix53xd_match_raw_best_single(
+                self->captured_raw,
+                (const Goodix53xdPix* const*) self->enroll_images->pdata,
+                self->enroll_images->len, self->enroll_fpn);
+            fp_dbg("enroll: best score vs earlier samples %d (duplicate %d)",
+                   dup, GOODIX53XD_ENROLL_DUPLICATE_SCORE);
+            if (dup >= GOODIX53XD_ENROLL_DUPLICATE_SCORE) {
+                g_clear_pointer(&self->captured_image, g_free);
+                fpi_device_enroll_progress(
+                    dev, self->enroll_stage, NULL,
+                    fpi_device_retry_new_msg(
+                        FP_DEVICE_RETRY_GENERAL,
+                        "Place a different part of your finger on the sensor"));
+                fpi_ssm_next_state(ssm);
+                return;
+            }
+        }
+
+        dump_sample(self, "enroll");
+        g_ptr_array_add(self->enroll_images,
+                        g_memdup2(self->captured_raw, sizeof(self->captured_raw)));
+        g_clear_pointer(&self->captured_image, g_free);
         self->enroll_stage++;
 
         fp_dbg("Enrollment stage %d/%d complete", self->enroll_stage,
@@ -692,6 +777,7 @@ static void enroll_ssm_done(FpiSsm* ssm, FpDevice* dev, GError* error)
     FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
 
     self->task_ssm = NULL;
+    g_clear_pointer(&self->enroll_fpn, g_free);
 
     if (error) {
         g_clear_pointer(&self->enroll_images, g_ptr_array_unref);
@@ -704,16 +790,36 @@ static void enroll_ssm_done(FpiSsm* ssm, FpDevice* dev, GError* error)
     fpi_device_get_enroll_data(dev, &print);
     fpi_print_set_type(print, FPI_PRINT_RAW);
 
+    const Goodix53xdPix* const* frames =
+        (const Goodix53xdPix* const*) self->enroll_images->pdata;
+    const guint n_frames = self->enroll_images->len;
+    guint64 session;
+    // 0 is reserved: it never matches a session in goodix53xd_calib_*().
+    do
+        session = ((guint64) g_random_int() << 32) | g_random_int();
+    while (session == 0);
+
+    // This session's mean frame becomes fixed-pattern calibration for every
+    // *other* template.
+    g_autofree float* mean = g_new(float, GOODIX53XD_FRAME_SIZE);
+    goodix53xd_mean_frame(frames, n_frames, mean);
+    goodix53xd_calib_add(self->calib, session, mean);
+    g_autofree char* path = calib_path();
+    g_autoptr(GError) save_error = NULL;
+    if (!goodix53xd_calib_save(self->calib, path, &save_error))
+        fp_warn("cannot save calibration: %s", save_error->message);
+
     GVariantBuilder builder;
-    g_variant_builder_init(&builder, G_VARIANT_TYPE("aay"));
-    for (guint i = 0; i < self->enroll_images->len; i++) {
-        guint8* img = g_ptr_array_index(self->enroll_images, i);
+    g_variant_builder_init(&builder, G_VARIANT_TYPE("aaq"));
+    for (guint i = 0; i < n_frames; i++)
         g_variant_builder_add(
-            &builder, "@ay",
-            g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, img,
-                                      GOODIX53XD_SENSOR_PIXELS, 1));
-    }
-    GVariant* data = g_variant_builder_end(&builder);
+            &builder, "@aq",
+            g_variant_new_fixed_array(G_VARIANT_TYPE_UINT16, frames[i],
+                                      GOODIX53XD_FRAME_SIZE,
+                                      sizeof(Goodix53xdPix)));
+    GVariant* data =
+        g_variant_new("(yt@aaq)", GOODIX53XD_PRINT_VERSION, session,
+                      g_variant_builder_end(&builder));
     g_object_set(G_OBJECT(print), "fpi-data", data, NULL);
 
     g_clear_pointer(&self->enroll_images, g_ptr_array_unref);
@@ -780,47 +886,52 @@ static void flush_pending_result(FpDevice* dev)
     self->pending_verify_result = 0;
 }
 
-// Match the probe against one stored template ("aay" of raw images).
-//
-// Returns the *second*-highest per-sample SIGFM score across the template's
-// GOODIX53XD_ENROLL_SAMPLES stored samples, not the single best one. Taking
-// the max of many independent pairwise comparisons (8 samples per enrolled
-// finger, times the gallery size on identify) inflates the false-accept
-// rate well beyond what a single-pair threshold calibration suggests: a
-// lone coincidentally-high score against one stored sample is enough to
-// accept with max-pooling, and on this small 64x80 sensor with few SIFT
-// keypoints such one-off collisions are common enough to cause cross-finger
-// false accepts (e.g. left index confused for an already-enrolled right
-// index). Requiring two independent stored samples to each clear the
-// threshold keeps genuine matches (which score highly consistently) intact
-// while making a single spurious high score insufficient.
-static int match_against_template(SigfmImgInfo* probe, GVariant* tmpl_data)
+// Match the latest capture against one stored template. Returns -1 if the
+// template isn't in the current print format.
+static int match_against_template(FpiDeviceGoodixTls53XD* self,
+                                  GVariant* tmpl_data)
 {
-    int best = 0;
-    int second_best = 0;
+    if (!print_data_is_current(tmpl_data))
+        return -1;
+
+    guint8 version;
+    guint64 session;
+    g_autoptr(GVariant) frames_v = NULL;
+    g_variant_get(tmpl_data, "(yt@aaq)", &version, &session, &frames_v);
+
+    g_autoptr(GPtrArray) samples = g_ptr_array_new();
+    // Children are unref'd only after matching: each sample points into its
+    // child's storage.
+    g_autoptr(GPtrArray) children =
+        g_ptr_array_new_with_free_func((GDestroyNotify) g_variant_unref);
     GVariantIter iter;
     GVariant* child;
-
-    g_variant_iter_init(&iter, tmpl_data);
+    g_variant_iter_init(&iter, frames_v);
     while ((child = g_variant_iter_next_value(&iter))) {
         gsize len;
-        const guint8* img = g_variant_get_fixed_array(child, &len, 1);
-        if (len == GOODIX53XD_SENSOR_PIXELS) {
-            SigfmImgInfo* tmpl_info =
-                sigfm_extract(img, GOODIX53XD_WIDTH, GOODIX53XD_HEIGHT);
-            int score = sigfm_match_score(probe, tmpl_info);
-            sigfm_free_info(tmpl_info);
-            if (score > best) {
-                second_best = best;
-                best = score;
-            }
-            else if (score > second_best) {
-                second_best = score;
-            }
-        }
-        g_variant_unref(child);
+        const Goodix53xdPix* frame =
+            g_variant_get_fixed_array(child, &len, sizeof(Goodix53xdPix));
+        g_ptr_array_add(children, child);
+        if (len == GOODIX53XD_FRAME_SIZE)
+            g_ptr_array_add(samples, (gpointer) frame);
     }
-    return second_best;
+    if (samples->len == 0)
+        return -1;
+
+    const Goodix53xdPix* const* frames =
+        (const Goodix53xdPix* const*) samples->pdata;
+    g_autofree float* fpn = g_new(float, GOODIX53XD_FRAME_SIZE);
+    if (!goodix53xd_calib_fpn_excluding(self->calib, session, fpn)) {
+        // No other enrollment session to calibrate from (e.g. a single
+        // enrolled finger): fall back to this template's own mean frame.
+        // Its ridges leak into the estimate, which costs genuine matches
+        // but not false accepts.
+        fp_dbg("no calibration from other sessions, using the template's own");
+        goodix53xd_mean_frame(frames, samples->len, fpn);
+    }
+
+    return goodix53xd_match_raw_template(self->captured_raw, frames,
+                                         samples->len, fpn);
 }
 
 enum verify_states {
@@ -849,6 +960,7 @@ static void verify_run_state(FpiSsm* ssm, FpDevice* dev)
 
     case VERIFY_CAPTURE_CHECK:
         if (!finger_is_present(self)) {
+            dump_empty_sample(self);
             g_clear_pointer(&self->captured_image, g_free);
             poll_again(dev, ssm, VERIFY_CAPTURE);
             return;
@@ -882,6 +994,8 @@ static void verify_run_state(FpiSsm* ssm, FpDevice* dev)
             return;
         }
 
+        dump_sample(self, "verify");
+
         if (action == FPI_DEVICE_ACTION_IDENTIFY) {
             GPtrArray* gallery = NULL;
             FpPrint* match = NULL;
@@ -894,8 +1008,13 @@ static void verify_run_state(FpiSsm* ssm, FpDevice* dev)
                 g_object_get(G_OBJECT(tmpl), "fpi-data", &tmpl_data, NULL);
                 if (tmpl_data == NULL)
                     continue;
-                int score = match_against_template(probe, tmpl_data);
+                int score = match_against_template(self, tmpl_data);
                 g_variant_unref(tmpl_data);
+                if (score < 0) {
+                    fp_warn("identify: gallery[%u] has an outdated print "
+                            "format, re-enroll it", i);
+                    continue;
+                }
                 fp_dbg("identify: gallery[%u] sigfm corroborated %d", i, score);
                 if (score >= GOODIX53XD_SIGFM_BEST_MIN && score > best_score) {
                     best_score = score;
@@ -920,7 +1039,8 @@ static void verify_run_state(FpiSsm* ssm, FpDevice* dev)
             fpi_device_get_verify_data(dev, &print);
             g_object_get(G_OBJECT(print), "fpi-data", &data, NULL);
             if (data != NULL) {
-                best_score = match_against_template(probe, data);
+                // Outdated formats were refused in dev_verify().
+                best_score = MAX(match_against_template(self, data), 0);
                 g_variant_unref(data);
             }
             fp_dbg("verify: corroborated sigfm %d (min %d)", best_score,
@@ -1003,6 +1123,17 @@ static void dev_open(FpDevice* dev)
     FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
     GError* error = NULL;
 
+    g_autofree char* path = calib_path();
+    g_autoptr(GError) calib_error = NULL;
+    g_clear_pointer(&self->calib, g_array_unref);
+    self->calib = goodix53xd_calib_load(path, &calib_error);
+    if (self->calib == NULL) {
+        fp_warn("ignoring calibration: %s", calib_error->message);
+        self->calib =
+            g_array_new(FALSE, FALSE, sizeof(Goodix53xdCalibSession));
+    }
+    fp_dbg("calibration %s: %u sessions", path, self->calib->len);
+
     // goodix_dev_init() claims the USB interface; it returns TRUE on success.
     if (!goodix_dev_init(dev, &error)) {
         fpi_device_open_complete(dev, error);
@@ -1020,8 +1151,11 @@ static void dev_close(FpDevice* dev)
 
     g_clear_pointer(&self->captured_image, g_free);
     g_clear_pointer(&self->enroll_images, g_ptr_array_unref);
+    g_clear_pointer(&self->enroll_fpn, g_free);
     g_clear_pointer(&self->otp, g_free);
+    g_clear_pointer(&self->calib, g_array_unref);
     clear_pending_result(self);
+    self->dump_empty_count = 0;
 
     goodix_reset_state(dev);
     goodix_dev_deinit(dev, &error);
@@ -1035,6 +1169,11 @@ static void dev_enroll(FpDevice* dev)
     self->enroll_stage = 0;
     g_clear_pointer(&self->enroll_images, g_ptr_array_unref);
     self->enroll_images = g_ptr_array_new_with_free_func(g_free);
+    g_clear_pointer(&self->enroll_fpn, g_free);
+    self->enroll_fpn = g_new(float, GOODIX53XD_FRAME_SIZE);
+    // Session 0 is never used, so this averages every earlier enrollment.
+    if (!goodix53xd_calib_fpn_excluding(self->calib, 0, self->enroll_fpn))
+        g_clear_pointer(&self->enroll_fpn, g_free);
 
     self->task_ssm = fpi_ssm_new(dev, enroll_run_state, ENROLL_NUM_STATES);
     fpi_ssm_start(self->task_ssm, enroll_ssm_done);
@@ -1043,6 +1182,22 @@ static void dev_enroll(FpDevice* dev)
 static void dev_verify(FpDevice* dev)
 {
     FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+
+    if (fpi_device_get_current_action(dev) == FPI_DEVICE_ACTION_VERIFY) {
+        FpPrint* print = NULL;
+        g_autoptr(GVariant) data = NULL;
+
+        fpi_device_get_verify_data(dev, &print);
+        g_object_get(G_OBJECT(print), "fpi-data", &data, NULL);
+        if (data == NULL || !print_data_is_current(data)) {
+            fpi_device_verify_complete(
+                dev, fpi_device_error_new_msg(
+                         FP_DEVICE_ERROR_DATA_INVALID,
+                         "Print was enrolled with an older goodixtls53xd "
+                         "version, please re-enroll"));
+            return;
+        }
+    }
 
     clear_pending_result(self);
     self->action_result_reported = FALSE;
