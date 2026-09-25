@@ -134,7 +134,10 @@ driver_sources = {
         'drivers/goodixmoc/goodix.c',
         'drivers/goodixmoc/goodix_proto.c',
     ),
-    'goodixtls53xd' : files('drivers/goodixtls/goodix53xd.c'),
+    'goodixtls53xd' : files(
+        'drivers/goodixtls/goodix53xd.c',
+        'drivers/goodixtls/goodix53xd_match.c',
+    ),
     'fpcmoc' : files('drivers/fpcmoc/fpc.c'),
     'realtek' : files('drivers/realtek/realtek.c'),
     'focaltech_moc' : files('drivers/focaltech_moc/focaltech_moc.c'),
@@ -314,6 +317,17 @@ udev_hwdb = executable('fprint-list-udev-hwdb',
     install: false,
     link_args: ['-Wl,--disable-new-dtags'],
 )
+
+# Offline accuracy evaluation of the goodixtls53xd matcher over frames dumped
+# with GOODIX53XD_DUMP (see sigfm/sigfm-eval.c). Not installed.
+if 'goodixtls53xd' in drivers
+    executable('goodix53xd-sigfm-eval',
+        'sigfm/sigfm-eval.c',
+        dependencies: libfprint_private_dep,
+        link_with: libfprint_drivers,
+        install: false,
+    )
+endif
 
 udev_hwdb_generator = custom_target('udev-hwdb',
     output: 'autosuspend.hwdb',
