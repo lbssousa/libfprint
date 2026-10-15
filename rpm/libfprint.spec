@@ -2,21 +2,21 @@
 ##
 ## Drop-in replacement for Fedora's libfprint that adds the goodixtls53xd
 ## driver (Goodix 27c6:538d) using a real TLS-PSK capture backend and the
-## SIGFM (SIFT) matcher. Based on upstream libfprint 1.94.10 plus the
+## SIGFM (SIFT) matcher. Based on upstream libfprint 1.94.100 plus the
 ## work in https://github.com/lbssousa/libfprint (tag below).
 ##
 ## The Release is deliberately high so this supersedes Fedora's stock
-## libfprint (1.94.10-5.fcNN) on the same Version. Rebase onto the next
-## upstream Version when Fedora moves past 1.94.10.
+## libfprint on the same Version. Rebase onto the next upstream Version
+## when Fedora moves past 1.94.100.
 
 # GitHub release tag and the directory name inside its archive (GitHub strips
 # the leading "v" from vX.Y.Z-style tags).
-%global goodix_tag v1.94.10-goodix538d.2
-%global goodix_dir %{name}-1.94.10-goodix538d.2
+%global goodix_tag v1.94.100-goodix538d.1
+%global goodix_dir %{name}-1.94.100-goodix538d.1
 
 Name:           libfprint
-Version:        1.94.10
-Release:        101.goodix538d%{?dist}
+Version:        1.94.100
+Release:        100.goodix538d%{?dist}
 Summary:        Toolkit for fingerprint scanner (with Goodix 538d support)
 
 # Most of the code is LGPL-2.1-or-later; libfprint/nbis is NIST-PD.
@@ -25,7 +25,7 @@ License:        LGPL-2.1-or-later AND NIST-PD
 URL:            https://github.com/lbssousa/libfprint
 Source0:        %{url}/archive/refs/tags/%{goodix_tag}.tar.gz#/%{name}-%{goodix_tag}.tar.gz
 
-BuildRequires:  meson
+BuildRequires:  meson >= 0.62.0
 BuildRequires:  gcc
 BuildRequires:  gcc-c++
 BuildRequires:  openssl-devel
@@ -47,7 +47,7 @@ BuildRequires:  umockdev >= 0.13.2
 libfprint offers support for consumer fingerprint reader devices.
 
 This build adds the goodixtls53xd driver for the Goodix 27c6:538d sensor
-(real TLS-PSK capture + SIGFM matching) on top of upstream 1.94.10.
+(real TLS-PSK capture + SIGFM matching) on top of upstream 1.94.100.
 
 %package        devel
 Summary:        Development files for %{name}
@@ -104,6 +104,13 @@ the functionality of the installed %{name} package.
 %{_datadir}/installed-tests/libfprint-2/
 
 %changelog
+* Thu Oct 15 2026 Laercio de Sousa <laercio@sivali.sousa.nom.br> - 1.94.100-100.goodix538d
+- Rebase onto upstream libfprint 1.94.100 (meson >= 0.62 now required).
+- goodixtls53xd: register in upstream's new drivers_info table; mark it
+  endian-dependent so big-endian builds skip it.
+- Keep 27c6:5110 and 27c6:521d in the unsupported autosuspend list (their
+  goodixtls drivers are not built) and regenerate autosuspend.hwdb.
+
 * Fri Sep 25 2026 Laercio de Sousa <laercio@sivali.sousa.nom.br> - 1.94.10-101.goodix538d
 - goodixtls53xd: replace the OpenCV-based SIGFM matcher with a self-contained
   C implementation; drop the vendored OpenCV (Source1, cmake BuildRequires)
