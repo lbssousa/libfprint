@@ -1,0 +1,67 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [goodix-538d-sigfm-gtls]
+  pull_request:
+    branches: [goodix-538d-sigfm-gtls]
+  schedule:
+    - cron: '27 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: c-cpp
+            build-mode: manual
+          - language: actions
+            build-mode: none
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies
+        if: matrix.build-mode == 'manual'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            meson ninja-build gcc g++ pkg-config \
+            libglib2.0-dev libgusb-dev libgudev-1.0-dev \
+            libpixman-1-dev libssl-dev libcairo2-dev \
+            gobject-introspection libgirepository1.0-dev \
+            systemd-dev
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: security-extended
+
+      # Build every default driver (including goodixtls53xd and the SIGFM
+      # matcher) so CodeQL sees all of the C code.
+      - name: Build
+        if: matrix.build-mode == 'manual'
+        run: |
+          meson setup _build -Ddoc=false -Dgtk-examples=false
+          meson compile -C _build
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          category: /language:${{ matrix.language }}
