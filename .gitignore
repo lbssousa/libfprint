@@ -5,3 +5,6 @@ _build
 # Meson wrap subprojects: keep the .wrap files, ignore what they fetch/extract.
 /subprojects/*/
 /subprojects/packagecache/
+
+# Print storage written by the examples (examples/storage.c) to the cwd.
+/test-storage.variant
