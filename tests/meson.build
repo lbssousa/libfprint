@@ -321,6 +321,29 @@ if 'virtual_image' in drivers
     ]
 endif
 
+if 'goodixtls53xd' in drivers
+    # Built from the driver's source: the drivers aren't in a library that
+    # tests can link to, and this part doesn't need a device.
+    goodixtls_server_test = executable('test-goodixtls-server',
+        sources: [
+            'test-goodixtls-server.c',
+            '../libfprint/drivers/goodixtls/goodixtls.c',
+        ],
+        include_directories: include_directories(
+            '../libfprint/drivers',
+            '../libfprint/drivers/goodixtls',
+        ),
+        dependencies: [ libfprint_private_dep, openssl_dep, threads_dep ],
+        c_args: common_cflags,
+        install: false,
+    )
+    test('goodixtls-server',
+        goodixtls_server_test,
+        suite: ['unit-tests'],
+        env: envs,
+    )
+endif
+
 unit_tests_deps = { 'fpi-assembling' : [cairo_dep] }
 
 foreach test_name: unit_tests
