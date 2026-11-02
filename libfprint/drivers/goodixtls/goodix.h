@@ -22,6 +22,9 @@
 // 1 seconds USB timeout
 #define GOODIX_TIMEOUT (1000)
 
+// Pause before reading again after a failed USB transfer
+#define GOODIX_READ_RETRY_MS (100)
+
 G_DECLARE_DERIVABLE_TYPE(FpiDeviceGoodixTls, fpi_device_goodixtls, FPI,
                          DEVICE_GOODIXTLS, FpDevice)
 
@@ -128,7 +131,10 @@ gboolean goodix_send_pack(FpDevice *dev, guint8 flags, guint8 *payload,
                           guint16 length, GDestroyNotify free_func,
                           GError **error);
 
-void goodix_send_protocol(FpDevice *dev, guint8 cmd, guint8 *payload,
+// Returns TRUE if the command went out. Otherwise, the callback has already
+// been called with the error: a command that doesn't start must not leave its
+// caller waiting.
+gboolean goodix_send_protocol(FpDevice *dev, guint8 cmd, guint8 *payload,
                           guint16 length, GDestroyNotify free_func,
                           gboolean calc_checksum, guint timeout_ms,
                           gboolean reply, GoodixCmdCallback callback,
@@ -228,6 +234,9 @@ gboolean goodix_dev_init(FpDevice *dev, GError **error);
 gboolean goodix_dev_deinit(FpDevice *dev, GError **error);
 
 void goodix_reset_state(FpDevice* dev);
+
+// Whether cmd was sent and its ack or reply are still awaited.
+gboolean goodix_command_in_flight(FpDevice* dev, guint8 cmd);
 
 // ---- DEV SECTION END ----
 

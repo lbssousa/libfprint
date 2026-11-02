@@ -25,6 +25,9 @@
 
 #define GOODIX_TLS_SERVER_PORT 4433
 
+// How long the handshake waits for the TLS server thread to produce output
+#define GOODIX_TLS_IO_TIMEOUT_MS 2000
+
 // static const guint8 goodix_511_psk_0[64] = {0};
 static const guint8 goodix_511_psk_0[] = {
     0xba, 0x1a, 0x86, 0x03, 0x7c, 0x1d, 0x3c, 0x71, 0xc3, 0xaf, 0x34,
@@ -68,6 +71,7 @@ typedef struct _GoodixTlsServer {
     // SSL* cli_ssl_layer;
     int client_fd;
     pthread_t serve_thread;
+    gboolean serve_thread_started;
 } GoodixTlsServer;
 
 // This is called only once to init the TLS server.
@@ -75,6 +79,10 @@ typedef struct _GoodixTlsServer {
 gboolean goodix_tls_server_init(GoodixTlsServer* self, GError** error);
 
 gboolean goodix_tls_init_cli(GoodixTlsServer* self, GError** err);
+
+// Called once the handshake is done. The sockets are only used from the main
+// loop from then on, which must never block on them.
+gboolean goodix_tls_server_set_nonblocking(GoodixTlsServer* self, GError** error);
 
 // This can be called multiple times. It is called when the device send a TLS
 // packet.
@@ -85,6 +93,7 @@ int goodix_tls_client_send(GoodixTlsServer* self, guint8* data, guint16 length);
 
 int goodix_tls_client_recv(GoodixTlsServer* self, guint8* data, guint16 length);
 
-// This is called only once to deinit the TLS server.
+// This is called only once to deinit the TLS server, even if init failed or
+// the handshake is still running.
 // Return TRUE on success, FALSE otherwise and error should be set.
 gboolean goodix_tls_server_deinit(GoodixTlsServer* self, GError** error);
