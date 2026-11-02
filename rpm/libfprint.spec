@@ -11,12 +11,12 @@
 
 # GitHub release tag and the directory name inside its archive (GitHub strips
 # the leading "v" from vX.Y.Z-style tags).
-%global goodix_tag v1.94.100-goodix538d.1
-%global goodix_dir %{name}-1.94.100-goodix538d.1
+%global goodix_tag v1.94.100-goodix538d.2
+%global goodix_dir %{name}-1.94.100-goodix538d.2
 
 Name:           libfprint
 Version:        1.94.100
-Release:        100.goodix538d%{?dist}
+Release:        101.goodix538d%{?dist}
 Summary:        Toolkit for fingerprint scanner (with Goodix 538d support)
 
 # Most of the code is LGPL-2.1-or-later; libfprint/nbis is NIST-PD.
@@ -104,6 +104,13 @@ the functionality of the installed %{name} package.
 %{_datadir}/installed-tests/libfprint-2/
 
 %changelog
+* Mon Nov 02 2026 Laercio de Sousa <laercio@sivali.sousa.nom.br> - 1.94.100-101.goodix538d
+- goodixtls: never block fprintd's main loop on the TLS sockets, and time out
+  commands and handshake reads that go unanswered.
+- goodixtls: report TLS failures and clean up after a failed open.
+- goodixtls53xd: keep the TLS session in sync across a cancel.
+- goodixtls: fix a per-frame leak and the read loop spinning on errors.
+
 * Thu Oct 15 2026 Laercio de Sousa <laercio@sivali.sousa.nom.br> - 1.94.100-100.goodix538d
 - Rebase onto upstream libfprint 1.94.100 (meson >= 0.62 now required).
 - goodixtls53xd: register in upstream's new drivers_info table; mark it
