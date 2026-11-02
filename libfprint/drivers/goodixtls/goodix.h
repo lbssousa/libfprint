@@ -22,6 +22,9 @@
 // 1 seconds USB timeout
 #define GOODIX_TIMEOUT (1000)
 
+// Pause before reading again after a failed USB transfer
+#define GOODIX_READ_RETRY_MS (100)
+
 G_DECLARE_DERIVABLE_TYPE(FpiDeviceGoodixTls, fpi_device_goodixtls, FPI,
                          DEVICE_GOODIXTLS, FpDevice)
 

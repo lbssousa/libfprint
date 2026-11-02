@@ -55,6 +55,7 @@ typedef struct {
     GoodixCallbackInfo* tls_ready_callback;
 
     GCancellable* transfer_cancel_tkn;
+    GSource* read_retry;
     gboolean inited;
 } FpiDeviceGoodixTlsPrivate;
 
@@ -385,6 +386,15 @@ void goodix_receive_pack(FpDevice *dev, guint8 *data, guint32 length) {
   priv->length = 0;
 }
 
+static void goodix_receive_retry_cb(FpDevice *dev, gpointer user_data) {
+  FpiDeviceGoodixTls *self = FPI_DEVICE_GOODIXTLS(dev);
+  FpiDeviceGoodixTlsPrivate *priv =
+      fpi_device_goodixtls_get_instance_private(self);
+
+  priv->read_retry = NULL;
+  goodix_receive_data(dev);
+}
+
 void goodix_receive_data_cb(FpiUsbTransfer *transfer, FpDevice *dev,
                             gpointer user_data, GError *error) {
     FpiDeviceGoodixTls* self = FPI_DEVICE_GOODIXTLS(dev);
@@ -399,12 +409,19 @@ void goodix_receive_data_cb(FpiUsbTransfer *transfer, FpDevice *dev,
         return;
     }
   if (error) {
-    // Warn about error and free it.
     fp_warn("Receive data error: %s", error->message);
+
+    // There will be nothing else to read. Fail what's waiting for a reply.
+    if (g_error_matches(error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_NO_DEVICE)) {
+      priv->inited = FALSE;
+      goodix_receive_done(dev, NULL, 0, error);
+      return;
+    }
     g_error_free(error);
 
-    // Retry receiving data and return.
-    goodix_receive_data(dev);
+    // Retry receiving data, but don't spin on an error that persists.
+    priv->read_retry = fpi_device_add_timeout(
+        dev, GOODIX_READ_RETRY_MS, goodix_receive_retry_cb, NULL, NULL);
     return;
   }
 
@@ -1102,6 +1119,7 @@ gboolean goodix_dev_deinit(FpDevice *dev, GError **error) {
   FpiDeviceGoodixTlsPrivate *priv =
       fpi_device_goodixtls_get_instance_private(self);
 
+  g_clear_pointer(&priv->read_retry, g_source_destroy);
   g_clear_pointer(&priv->data, g_free);
   priv->length = 0;
   g_cancellable_cancel(priv->transfer_cancel_tkn);
@@ -1378,7 +1396,7 @@ static void goodix_tls_ready_image_handler(FpDevice* dev, guint8* data,
     }
 
     const guint16 size = -1;
-    guint8* buff = malloc(size);
+    g_autofree guint8* buff = g_malloc(size);
     GError* err = NULL;
     int read_size = goodix_tls_server_receive(priv->tls_hop, buff, size, &err);
     if (read_size <= 0) {
