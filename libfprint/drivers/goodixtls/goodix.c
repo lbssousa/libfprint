@@ -26,6 +26,7 @@
 #include <glib.h>
 #include <gusb.h>
 #include <openssl/ssl.h>
+#include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -1149,8 +1150,10 @@ static void on_tls_successfully_established(FpDevice* dev, gpointer user_data,
     FpiDeviceGoodixTls* self = FPI_DEVICE_GOODIXTLS(dev);
     FpiDeviceGoodixTlsPrivate* priv =
         fpi_device_goodixtls_get_instance_private(self);
+    if (!error)
+        goodix_tls_server_set_nonblocking(priv->tls_hop, &error);
     ((GoodixNoneCallback) priv->tls_ready_callback->callback)(
-        dev, priv->tls_ready_callback->user_data, NULL);
+        dev, priv->tls_ready_callback->user_data, error);
 }
 static void tls_handshake_done(FpiSsm* ssm, FpDevice* dev, GError* error)
 {
@@ -1172,7 +1175,7 @@ static void tls_handshake_run(FpiSsm* ssm, FpDevice* dev)
     if (stage == TLS_HANDSHAKE_STAGE_HELLO_S) {
         guint8 buff[1024];
         int size = goodix_tls_client_recv(priv->tls_hop, buff, sizeof(buff));
-        if (size < 0) {
+        if (size <= 0) {
             fpi_ssm_mark_failed(ssm, g_error_new(g_io_error_quark(), size,
                                                  "failed to read tls server "
                                                  "hello"));
@@ -1194,7 +1197,7 @@ static void tls_handshake_run(FpiSsm* ssm, FpDevice* dev)
         fp_dbg("Reading to proxy back");
         guint8 buff[1024];
         int size = goodix_tls_client_recv(priv->tls_hop, buff, sizeof(buff));
-        if (size < 0) {
+        if (size <= 0) {
             fpi_ssm_mark_failed(ssm, g_error_new(g_io_error_quark(), size,
                                                  "failed to read server "
                                                  "handshake"));
@@ -1301,7 +1304,14 @@ static void goodix_tls_ready_image_handler(FpDevice* dev, guint8* data,
     FpiDeviceGoodixTls* self = FPI_DEVICE_GOODIXTLS(dev);
     FpiDeviceGoodixTlsPrivate* priv =
         fpi_device_goodixtls_get_instance_private(self);
-    goodix_tls_client_send(priv->tls_hop, data, length);
+    if (goodix_tls_client_send(priv->tls_hop, data, length) < 0) {
+        callback(dev, NULL, 0, cb_info->user_data,
+                 g_error_new(G_IO_ERROR, g_io_error_from_errno(errno),
+                             "failed to pass the image to the TLS server: %s",
+                             g_strerror(errno)));
+        g_free(cb_info);
+        return;
+    }
 
     const guint16 size = -1;
     guint8* buff = malloc(size);

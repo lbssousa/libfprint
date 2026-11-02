@@ -19,6 +19,8 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <gio/gio.h>
 #include <glib.h>
 #include <netinet/in.h>
 #include <openssl/crypto.h>
@@ -30,6 +32,7 @@
 #include <signal.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <unistd.h>
 
 #include "drivers_api.h"
 #include "fp-device.h"
@@ -38,15 +41,14 @@
 #include "goodix.h"
 #include "goodixtls.h"
 
-static GError* err_from_ssl(void)
+// The queue can be empty, and then there is no reason string.
+static GError* err_from_ssl(const char* what)
 {
-    GError* err = malloc(sizeof(GError));
     unsigned long code = ERR_get_error();
-    err->code = code;
-    const char* msg = ERR_reason_error_string(code);
-    err->message = malloc(strlen(msg) + 1);
-    strcpy(err->message, msg);
-    return err;
+    const char* reason = code ? ERR_reason_error_string(code) : NULL;
+
+    return g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED, "%s: %s", what,
+                       reason ? reason : "no OpenSSL error queued");
 }
 
 static unsigned int tls_server_psk_server_callback(SSL *ssl,
@@ -99,15 +101,32 @@ int goodix_tls_client_send(GoodixTlsServer* self, guint8* data, guint16 length)
     return write(self->client_fd, data, length * sizeof(guint8));
 }
 int goodix_tls_client_recv(GoodixTlsServer* self, guint8* data, guint16 length) {
+    struct pollfd pfd = {.fd = self->client_fd, .events = POLLIN};
+    int ready = poll(&pfd, 1, GOODIX_TLS_IO_TIMEOUT_MS);
+
+    if (ready <= 0) {
+        if (ready == 0)
+            errno = ETIMEDOUT;
+        return -1;
+    }
     return read(self->client_fd, data, length * sizeof(guint8));
 }
 
 int goodix_tls_server_receive(GoodixTlsServer* self, guint8* data,
                               guint32 length, GError** error)
 {
+    ERR_clear_error();
     int retr = SSL_read(self->ssl_layer, data, length * sizeof(guint8));
     if (retr <= 0) {
-        *error = err_from_ssl();
+        // Every USB packet carries whole records and nothing else feeds the
+        // socket, so waiting for the rest of one would never end.
+        int ssl_error = SSL_get_error(self->ssl_layer, retr);
+        if (ssl_error == SSL_ERROR_WANT_READ ||
+            ssl_error == SSL_ERROR_WANT_WRITE)
+            *error = g_error_new(G_IO_ERROR, G_IO_ERROR_PARTIAL_INPUT,
+                                 "Incomplete TLS record");
+        else
+            *error = err_from_ssl("TLS read failed");
     }
     return retr;
 }
@@ -128,12 +147,30 @@ static void* goodix_tls_init_serve(void* me)
     int retr = SSL_accept(self->ssl_layer);
     fp_dbg("TLS server accept done");
     if (retr <= 0) {
-        self->connection_callback(self, err_from_ssl(), self->user_data);
+        self->connection_callback(self, err_from_ssl("TLS handshake failed"),
+                                  self->user_data);
     }
     else {
         self->connection_callback(self, NULL, self->user_data);
     }
     return NULL;
+}
+
+static gboolean set_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL);
+
+    return flags != -1 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
+}
+
+gboolean goodix_tls_server_set_nonblocking(GoodixTlsServer* self, GError** error)
+{
+    if (set_nonblocking(self->sock_fd) && set_nonblocking(self->client_fd))
+        return TRUE;
+
+    g_set_error(error, G_IO_ERROR, g_io_error_from_errno(errno),
+                "failed to make TLS sockets non-blocking: %s", g_strerror(errno));
+    return FALSE;
 }
 
 gboolean goodix_tls_server_deinit(GoodixTlsServer* self, GError** error)
