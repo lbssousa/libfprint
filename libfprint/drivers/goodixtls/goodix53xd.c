@@ -585,11 +585,10 @@ static void on_fdt_down_second(FpDevice* dev, guint8* data, guint16 len,
                                gpointer ssm, GError* err)
 {
     if (err) {
-        // Treat a transfer timeout as "no finger yet" and re-arm so the user
-        // gets more than one USB timeout window to press. (Needs hardware
-        // tuning; a real finger-up/finger-down FDT event would be cleaner.)
-        if (g_error_matches(err, G_USB_DEVICE_ERROR,
-                            G_USB_DEVICE_ERROR_TIMED_OUT)) {
+        // Treat a command timeout as "no finger yet" and re-arm so the user
+        // gets more than one timeout window to press. (Needs hardware tuning;
+        // a real finger-up/finger-down FDT event would be cleaner.)
+        if (g_error_matches(err, G_IO_ERROR, G_IO_ERROR_TIMED_OUT)) {
             g_clear_error(&err);
             capture_fdt_down_arm(dev, ssm);
             return;
@@ -1207,6 +1206,20 @@ static void dev_verify(FpDevice* dev)
     fpi_ssm_start(self->task_ssm, verify_ssm_done);
 }
 
+static void on_cancel_idle_done(FpDevice* dev, gpointer user_data, GError* error)
+{
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+
+    if (error) {
+        fp_dbg("MCU didn't confirm idle mode on cancel: %s", error->message);
+        g_error_free(error);
+    }
+    if (self->task_ssm)
+        fpi_ssm_mark_failed(self->task_ssm,
+                            g_error_new(G_IO_ERROR, G_IO_ERROR_CANCELLED,
+                                        "Cancelled"));
+}
+
 static void dev_cancel(FpDevice* dev)
 {
     FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
@@ -1233,14 +1246,10 @@ static void dev_cancel(FpDevice* dev)
         // fprintd process's life (confirmed in the field: only a full
         // fprintd restart recovers). Explicitly switching the MCU to idle
         // closes out any pending FDT sequence on its side before the next
-        // verify attempt starts. Fire-and-forget: priv state is already
-        // clear so it can't collide with the next command, and it
-        // self-resolves via ack-or-GOODIX_TIMEOUT either way.
-        goodix_send_mcu_switch_to_idle_mode(dev, 20, NULL, NULL);
-
-        fpi_ssm_mark_failed(self->task_ssm,
-                            g_error_new(G_IO_ERROR, G_IO_ERROR_CANCELLED,
-                                        "Cancelled"));
+        // verify attempt starts. The action only ends on its ack or
+        // GOODIX_TIMEOUT: the next action's first command would otherwise
+        // find this one still running.
+        goodix_send_mcu_switch_to_idle_mode(dev, 20, on_cancel_idle_done, NULL);
     }
 }
 

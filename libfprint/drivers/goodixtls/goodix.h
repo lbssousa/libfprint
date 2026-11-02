@@ -128,7 +128,10 @@ gboolean goodix_send_pack(FpDevice *dev, guint8 flags, guint8 *payload,
                           guint16 length, GDestroyNotify free_func,
                           GError **error);
 
-void goodix_send_protocol(FpDevice *dev, guint8 cmd, guint8 *payload,
+// Returns TRUE if the command went out. Otherwise, the callback has already
+// been called with the error: a command that doesn't start must not leave its
+// caller waiting.
+gboolean goodix_send_protocol(FpDevice *dev, guint8 cmd, guint8 *payload,
                           guint16 length, GDestroyNotify free_func,
                           gboolean calc_checksum, guint timeout_ms,
                           gboolean reply, GoodixCmdCallback callback,
