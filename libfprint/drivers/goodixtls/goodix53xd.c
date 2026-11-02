@@ -120,6 +120,9 @@ struct _FpiDeviceGoodixTls53XD {
   // before calling fpi_ssm_mark_failed(), which asserts none is pending.
   gboolean poll_timeout_pending;
 
+  // TRUE from dev_cancel() until the action has actually been failed.
+  gboolean cancel_pending;
+
   // Deferred verify/identify result reporting
   gboolean verify_wait_finger_up;
   gboolean pending_result_report;
@@ -508,9 +511,18 @@ static void dump_empty_sample(FpiDeviceGoodixTls53XD* self)
     dump_sample(self, "empty");
 }
 
+static void finish_cancel(FpDevice* dev);
+
 static void on_capture_image(FpDevice* dev, guint8* data, guint16 len,
                              gpointer ssm, GError* err)
 {
+    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
+
+    if (self->cancel_pending) {
+        g_clear_error(&err);
+        finish_cancel(dev);
+        return;
+    }
     if (err) {
         fpi_ssm_mark_failed(ssm, err);
         return;
@@ -522,7 +534,6 @@ static void on_capture_image(FpDevice* dev, guint8* data, guint16 len,
         return;
     }
 
-    FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
     Goodix53xdPix* frame = self->captured_raw;
     decode_frame(frame, data);
 
@@ -1131,6 +1142,8 @@ static void dev_open(FpDevice* dev)
     FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
     GError* error = NULL;
 
+    self->cancel_pending = FALSE;
+
     g_autofree char* path = calib_path();
     g_autoptr(GError) calib_error = NULL;
     g_clear_pointer(&self->calib, g_array_unref);
@@ -1174,6 +1187,7 @@ static void dev_enroll(FpDevice* dev)
 {
     FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
 
+    self->cancel_pending = FALSE;
     self->enroll_stage = 0;
     g_clear_pointer(&self->enroll_images, g_ptr_array_unref);
     self->enroll_images = g_ptr_array_new_with_free_func(g_free);
@@ -1210,6 +1224,7 @@ static void dev_verify(FpDevice* dev)
     clear_pending_result(self);
     self->action_result_reported = FALSE;
     self->verify_wait_finger_up = FALSE;
+    self->cancel_pending = FALSE;
 
     self->task_ssm = fpi_ssm_new(dev, verify_run_state, VERIFY_NUM_STATES);
     fpi_ssm_start(self->task_ssm, verify_ssm_done);
@@ -1223,10 +1238,31 @@ static void on_cancel_idle_done(FpDevice* dev, gpointer user_data, GError* error
         fp_dbg("MCU didn't confirm idle mode on cancel: %s", error->message);
         g_error_free(error);
     }
+    self->cancel_pending = FALSE;
     if (self->task_ssm)
         fpi_ssm_mark_failed(self->task_ssm,
                             g_error_new(G_IO_ERROR, G_IO_ERROR_CANCELLED,
                                         "Cancelled"));
+}
+
+static void finish_cancel(FpDevice* dev)
+{
+    goodix_reset_state(dev);
+
+    // A FDT_DOWN "wait for finger" (0x32) may still be outstanding on
+    // the MCU itself when we get here: goodix_reset_state() only clears
+    // our own ack/reply/timeout bookkeeping, it can't un-send bytes
+    // already on the wire. Left alone, the MCU eventually replies to
+    // that stale FDT_DOWN once a *new* command is already in flight, and
+    // its cmd byte (0x32) no longer matches priv->cmd -> permanent
+    // "Invalid protocol/ACK command" desync for the rest of this
+    // fprintd process's life (confirmed in the field: only a full
+    // fprintd restart recovers). Explicitly switching the MCU to idle
+    // closes out any pending FDT sequence on its side before the next
+    // verify attempt starts. The action only ends on its ack or
+    // GOODIX_TIMEOUT: the next action's first command would otherwise
+    // find this one still running.
+    goodix_send_mcu_switch_to_idle_mode(dev, 20, on_cancel_idle_done, NULL);
 }
 
 static void dev_cancel(FpDevice* dev)
@@ -1243,22 +1279,16 @@ static void dev_cancel(FpDevice* dev)
             fpi_ssm_cancel_delayed_state_change(self->task_ssm);
             self->poll_timeout_pending = FALSE;
         }
-        goodix_reset_state(dev);
+        self->cancel_pending = TRUE;
 
-        // A FDT_DOWN "wait for finger" (0x32) may still be outstanding on
-        // the MCU itself when we get here: goodix_reset_state() only clears
-        // our own ack/reply/timeout bookkeeping, it can't un-send bytes
-        // already on the wire. Left alone, the MCU eventually replies to
-        // that stale FDT_DOWN once a *new* command is already in flight, and
-        // its cmd byte (0x32) no longer matches priv->cmd -> permanent
-        // "Invalid protocol/ACK command" desync for the rest of this
-        // fprintd process's life (confirmed in the field: only a full
-        // fprintd restart recovers). Explicitly switching the MCU to idle
-        // closes out any pending FDT sequence on its side before the next
-        // verify attempt starts. The action only ends on its ack or
-        // GOODIX_TIMEOUT: the next action's first command would otherwise
-        // find this one still running.
-        goodix_send_mcu_switch_to_idle_mode(dev, 20, on_cancel_idle_done, NULL);
+        // Every image is a TLS record, numbered in sequence: dropping the one
+        // on its way would fail all the captures after it, until the device
+        // is reopened. Let on_capture_image() take it to the TLS server and
+        // carry on from there; the command's timeout guarantees it gets called.
+        if (goodix_command_in_flight(dev, GOODIX_CMD_MCU_GET_IMAGE))
+            return;
+
+        finish_cancel(dev);
     }
 }
 

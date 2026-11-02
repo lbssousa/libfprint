@@ -359,7 +359,20 @@ void goodix_receive_pack(FpDevice *dev, guint8 *data, guint32 length) {
 
     case GOODIX_FLAGS_TLS_DATA:
         fp_dbg("Got TLS data msg");
+        // A reply left over from a command that timed out must not be taken
+        // for the answer to the current one.
+        if (priv->cmd != GOODIX_CMD_MCU_GET_IMAGE) {
+            fp_warn("Unexpected TLS data during command: 0x%02x", priv->cmd);
+            break;
+        }
         // GOODIX 52xd: Remove first 9 to get valid TLS content
+        if (payload_len < 9) {
+            goodix_receive_done(dev, NULL, 0,
+                                g_error_new(G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                                            "Short TLS data message: %d",
+                                            payload_len));
+            break;
+        }
         goodix_receive_done(dev, payload+9, payload_len-9, NULL);
         break;
 
@@ -1069,6 +1082,18 @@ void goodix_reset_state(FpDevice* dev)
     priv->reply = FALSE;
     priv->callback = NULL;
     priv->user_data = NULL;
+    // Whatever was being assembled belongs to the command that just ended.
+    g_clear_pointer(&priv->data, g_free);
+    priv->length = 0;
+}
+
+gboolean goodix_command_in_flight(FpDevice* dev, guint8 cmd)
+{
+    FpiDeviceGoodixTls* self = FPI_DEVICE_GOODIXTLS(dev);
+    FpiDeviceGoodixTlsPrivate* priv =
+        fpi_device_goodixtls_get_instance_private(self);
+
+    return priv->cmd == cmd && (priv->ack || priv->reply);
 }
 
 gboolean goodix_dev_deinit(FpDevice *dev, GError **error) {

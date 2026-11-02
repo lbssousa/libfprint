@@ -232,6 +232,9 @@ gboolean goodix_dev_deinit(FpDevice *dev, GError **error);
 
 void goodix_reset_state(FpDevice* dev);
 
+// Whether cmd was sent and its ack or reply are still awaited.
+gboolean goodix_command_in_flight(FpDevice* dev, guint8 cmd);
+
 // ---- DEV SECTION END ----
 
 // -----------------------------------------------------------------------------
