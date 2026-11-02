@@ -403,6 +403,15 @@ static void open_ssm_done(FpiSsm* ssm, FpDevice* dev, GError* error)
     FpiDeviceGoodixTls53XD* self = FPI_DEVICE_GOODIXTLS53XD(dev);
 
     self->task_ssm = NULL;
+    if (error) {
+        // A failed open doesn't get a dev_close().
+        g_autoptr(GError) deinit_error = NULL;
+
+        g_clear_pointer(&self->otp, g_free);
+        g_clear_pointer(&self->calib, g_array_unref);
+        if (!goodix_dev_deinit(dev, &deinit_error))
+            fp_dbg("cleanup after failed open: %s", deinit_error->message);
+    }
     fpi_device_open_complete(dev, error);
 }
 

@@ -71,6 +71,7 @@ typedef struct _GoodixTlsServer {
     // SSL* cli_ssl_layer;
     int client_fd;
     pthread_t serve_thread;
+    gboolean serve_thread_started;
 } GoodixTlsServer;
 
 // This is called only once to init the TLS server.
@@ -92,6 +93,7 @@ int goodix_tls_client_send(GoodixTlsServer* self, guint8* data, guint16 length);
 
 int goodix_tls_client_recv(GoodixTlsServer* self, guint8* data, guint16 length);
 
-// This is called only once to deinit the TLS server.
+// This is called only once to deinit the TLS server, even if init failed or
+// the handshake is still running.
 // Return TRUE on success, FALSE otherwise and error should be set.
 gboolean goodix_tls_server_deinit(GoodixTlsServer* self, GError** error);
